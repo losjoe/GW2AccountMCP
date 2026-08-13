@@ -1,0 +1,24 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GW2AccountMCP", "src\GW2AccountMCP\GW2AccountMCP.csproj", "{D4E41D80-A172-44C3-B1DE-4272168F2809}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "GW2AccountMCP.Tests", "tests\GW2AccountMCP.Tests\GW2AccountMCP.Tests.csproj", "{DE9395E9-03B2-4282-8FC1-5B3D43BD9F65}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{D4E41D80-A172-44C3-B1DE-4272168F2809}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D4E41D80-A172-44C3-B1DE-4272168F2809}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D4E41D80-A172-44C3-B1DE-4272168F2809}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D4E41D80-A172-44C3-B1DE-4272168F2809}.Release|Any CPU.Build.0 = Release|Any CPU
+		{DE9395E9-03B2-4282-8FC1-5B3D43BD9F65}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{DE9395E9-03B2-4282-8FC1-5B3D43BD9F65}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{DE9395E9-03B2-4282-8FC1-5B3D43BD9F65}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{DE9395E9-03B2-4282-8FC1-5B3D43BD9F65}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

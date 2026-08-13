@@ -1,0 +1,46 @@
+.idea/
+bin/
+obj/
+/packages/
+riderModule.iml
+/_ReSharper.Caches/
+.obsidian/
+RESUME.md
+agent-requests/*
+.air/plans/
+.opencode/
+
+simulation-chronicle-seed*
+
+logs/*
+logs
+
+# Windows bash workaround - prevents accidentally created nul files
+nul
+
+# Simulation output (chronicle JSON files)
+output/
+content/working/*/prompts/
+content/working/*/repair_prompts/
+
+# Refactoring backups - for comparison only, not committed
+backup/
+output/
+test-results/
+TestResults/
+
+# Git worktrees for isolated development
+.worktrees/
+.claude/worktrees/
+
+# Convenience symlinks to Debug executables
+sim-console
+visualizer
+
+# Docs live in Obsidian vault (synced via /sync-project-docs)
+/docs/
+.aider*
+
+# Local configuration that may contain secrets
+appsettings.Development.json
+launchSettings.local.json
