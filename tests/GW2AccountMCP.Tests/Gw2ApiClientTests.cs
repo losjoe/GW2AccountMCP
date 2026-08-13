@@ -558,6 +558,228 @@ public sealed class Gw2ApiClientTests
         Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
     }
 
+    [Fact]
+    public async Task GetCharacterBagsAsync_missing_key_is_actionable_and_makes_no_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("{\"permissions\":[\"characters\",\"inventories\"]}", "account permission")]
+    [InlineData("{\"permissions\":[\"account\",\"inventories\"]}", "characters permission")]
+    [InlineData("{\"permissions\":[\"account\",\"characters\"]}", "inventories permission")]
+    public async Task GetCharacterBagsAsync_requires_each_permission_before_character_requests(string tokenResponse, string requiredPermission)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(tokenResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains(requiredPermission, error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterBagsAsync_traverses_every_character_and_preserves_stack_locations()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""",
+            """["First Hero","Path/Query?# Hero","Last Hero"]""",
+            """{"bags":[null,{"id":901,"size":3,"inventory":[null,{"id":11,"count":2},{"id":11,"count":3}]}]}""",
+            """{"bags":[{"id":902,"size":1,"inventory":[{"id":11,"count":4}]}]}""",
+            """{"bags":[{"id":903,"size":2,"inventory":[null,{"id":12,"count":5}]}]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var bags = await client.GetCharacterBagsAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [
+                (11, 2L, "First Hero", 1, 1),
+                (11, 3L, "First Hero", 1, 2),
+                (11, 4L, "Path/Query?# Hero", 0, 0),
+                (12, 5L, "Last Hero", 0, 1)
+            ],
+            bags.Stacks.Select(stack => (stack.Id, stack.Count, stack.Character, stack.BagIndex, stack.SlotIndex)));
+        Assert.Equal(
+            [
+                "/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/characters/First%20Hero/inventory?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/characters/Path%2FQuery%3F%23%20Hero/inventory?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/characters/Last%20Hero/inventory?lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+            ],
+            handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
+    [Fact]
+    public async Task GetCharacterBagsAsync_accepts_empty_characters_bags_and_slots()
+    {
+        var emptyCharactersHandler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""",
+            "[]");
+        using var emptyCharactersHttpClient = new HttpClient(emptyCharactersHandler) { BaseAddress = new Uri("https://example.test") };
+        var emptyCharactersClient = new Gw2ApiClient(emptyCharactersHttpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var emptyCharacters = await emptyCharactersClient.GetCharacterBagsAsync(CancellationToken.None);
+
+        Assert.Empty(emptyCharacters.Stacks);
+        Assert.Equal(2, emptyCharactersHandler.RequestUris.Count);
+
+        var emptyBagsHandler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""",
+            """["Empty Bags","Empty Slots"]""",
+            """{"bags":[]}""",
+            """{"bags":[{"id":904,"size":2,"inventory":[null,null]}]}""");
+        using var emptyBagsHttpClient = new HttpClient(emptyBagsHandler) { BaseAddress = new Uri("https://example.test") };
+        var emptyBagsClient = new Gw2ApiClient(emptyBagsHttpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var emptyBags = await emptyBagsClient.GetCharacterBagsAsync(CancellationToken.None);
+
+        Assert.Empty(emptyBags.Stacks);
+        Assert.Equal(4, emptyBagsHandler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("{}")]
+    [InlineData("[null]")]
+    [InlineData("[\"\"]")]
+    [InlineData("[\"Duplicate Hero\",\"Duplicate Hero\"]")]
+    public async Task GetCharacterBagsAsync_rejects_invalid_character_lists(string characterResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""",
+            characterResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains("character-list response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(characterResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("{}")]
+    [InlineData("{\"bags\":null}")]
+    [InlineData("{\"bags\":[{}]}")]
+    [InlineData("{\"bags\":[{\"id\":0,\"size\":1,\"inventory\":[null]}]}")]
+    [InlineData("{\"bags\":[{\"id\":1,\"size\":0,\"inventory\":[]}]}")]
+    [InlineData("{\"bags\":[{\"id\":1,\"size\":1,\"inventory\":null}]}")]
+    [InlineData("{\"bags\":[{\"id\":1,\"size\":2,\"inventory\":[null]}]}")]
+    [InlineData("{\"bags\":[{\"id\":1,\"size\":1,\"inventory\":[{}]}]}")]
+    [InlineData("{\"bags\":[{\"id\":1,\"size\":1,\"inventory\":[{\"id\":0,\"count\":1}]}]}")]
+    [InlineData("{\"bags\":[{\"id\":1,\"size\":1,\"inventory\":[{\"id\":2,\"count\":0}]}]}")]
+    public async Task GetCharacterBagsAsync_rejects_invalid_character_inventory(string inventoryResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""",
+            """["Synthetic Hero"]""",
+            inventoryResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains("character-inventory response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(inventoryResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCharacterBagsAsync_character_failure_is_total_and_stops_sequential_traversal()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","characters","inventories"]}"""),
+            new ResponseSpec("""["First Hero","Failed Hero","Unrequested Hero"]"""),
+            new ResponseSpec("""{"bags":[{"id":901,"size":1,"inventory":[{"id":11,"count":2}]}]}"""),
+            new ResponseSpec("account data must not appear in the error", HttpStatusCode.InternalServerError));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains("character-inventory request failed with HTTP 500", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("account data", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(4, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("Unrequested", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterBagsAsync_rejects_partial_character_list()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","characters","inventories"]}"""),
+            new ResponseSpec("""["Partial Hero"]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains("character-list request failed with HTTP 206", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCharacterBagsAsync_rejects_partial_character_inventory_and_stops_traversal()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","characters","inventories"]}"""),
+            new ResponseSpec("""["Partial Hero","Unrequested Hero"]"""),
+            new ResponseSpec("""{"bags":[]}""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBagsAsync(CancellationToken.None));
+
+        Assert.Contains("character-inventory request failed with HTTP 206", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(3, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("Unrequested", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterBagsAsync_reuses_authenticated_single_retry_for_character_inventory()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","characters","inventories"]}"""),
+            new ResponseSpec("""["Retry Hero"]"""),
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec("""{"bags":[]}"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var bags = await client.GetCharacterBagsAsync(CancellationToken.None);
+
+        Assert.Empty(bags.Stacks);
+        Assert.Equal(4, handler.RequestUris.Count);
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.StartsWith("/v2/characters/Retry%20Hero/inventory?", StringComparison.Ordinal)));
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
     private sealed record ResponseSpec(string Content, HttpStatusCode StatusCode = HttpStatusCode.OK, TimeSpan? RetryAfter = null);
 
     private sealed class ImmediateTimeProvider : TimeProvider

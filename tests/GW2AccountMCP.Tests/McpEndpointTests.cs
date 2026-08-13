@@ -194,6 +194,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2AccountStorage([]));
+
+        public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2CharacterBags([]));
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -206,6 +209,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required inventories permission. Create a key with the inventories permission.");
+
+        public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required characters permission. Create a key with the characters permission.");
     }
 
     private sealed class FixedTimeProvider : TimeProvider
