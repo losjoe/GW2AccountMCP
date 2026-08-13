@@ -7,6 +7,7 @@ namespace GW2AccountMCP.Gw2;
 public interface IGw2ApiClient
 {
     Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken);
+    Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
@@ -23,7 +24,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
         }
 
-        await ValidateAccountPermissionAsync(cancellationToken);
+        await ValidatePermissionsAsync(["account"], cancellationToken);
 
         using var response = await SendWithSingleRetryAsync("/v2/account", cancellationToken);
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
@@ -40,7 +41,53 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2Account(account.Name!, account.World!.Value, account.Created!.Value, account.Access!);
     }
 
-    private async Task ValidateAccountPermissionAsync(CancellationToken cancellationToken)
+    public async Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        await ValidatePermissionsAsync(["account", "wallet"], cancellationToken);
+
+        using var response = await SendWithSingleRetryAsync("/v2/account/wallet", cancellationToken);
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw InvalidKey();
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new Gw2ConfigurationException($"GW2 wallet request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        var wallet = await DeserializeWalletAsync(response, cancellationToken);
+        if (wallet.Count == 0)
+        {
+            return new Gw2Wallet([], []);
+        }
+
+        var currencyIds = wallet.Select(balance => balance.Id!.Value).Distinct().Order().ToArray();
+        if (currencyIds.Length > 200)
+        {
+            throw new Gw2ConfigurationException("GW2 returned too many wallet currency definitions. Try again later.");
+        }
+
+        using var currenciesResponse = await SendWithSingleRetryAsync($"/v2/currencies?ids={Uri.EscapeDataString(string.Join(',', currencyIds))}", cancellationToken, authenticated: false);
+        if (!currenciesResponse.IsSuccessStatusCode)
+        {
+            throw new Gw2ConfigurationException($"GW2 currency request failed with HTTP {(int)currenciesResponse.StatusCode}. Try again later.");
+        }
+
+        var currencies = await DeserializeCurrenciesAsync(currenciesResponse, cancellationToken);
+        var namesById = currencies.ToDictionary(currency => currency.Id!.Value, currency => currency.Name!);
+        var missingCurrencyIds = currencyIds.Where(id => !namesById.ContainsKey(id)).ToArray();
+        return new Gw2Wallet(
+            wallet.Select(balance => new Gw2WalletBalance(balance.Id!.Value, namesById.GetValueOrDefault(balance.Id.Value), balance.Value!.Value)).ToArray(),
+            missingCurrencyIds.Select(id => new Gw2WalletWarning("currency_metadata_missing", id)).ToArray());
+    }
+
+    private async Task ValidatePermissionsAsync(IReadOnlyList<string> requiredPermissions, CancellationToken cancellationToken)
     {
         using var response = await SendWithSingleRetryAsync("/v2/tokeninfo", cancellationToken);
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
@@ -54,9 +101,12 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
 
         var tokenInfo = await DeserializeTokenInfoAsync(response, cancellationToken);
-        if (!tokenInfo.Permissions!.Contains("account", StringComparer.OrdinalIgnoreCase))
+        foreach (var requiredPermission in requiredPermissions)
         {
-            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required account permission. Create a key with the account permission.");
+            if (!tokenInfo.Permissions!.Contains(requiredPermission, StringComparer.OrdinalIgnoreCase))
+            {
+                throw new Gw2ConfigurationException($"GW2_API_KEY is missing the required {requiredPermission} permission. Create a key with the {requiredPermission} permission.");
+            }
         }
     }
 
@@ -85,11 +135,51 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         {
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
             var tokenInfo = await JsonSerializer.DeserializeAsync<TokenInfo>(stream, JsonOptions, cancellationToken);
-            return tokenInfo?.Permissions is not null ? tokenInfo : throw InvalidTokenPermissionResponse();
+            return tokenInfo?.Permissions is { } permissions && permissions.All(permission => !string.IsNullOrWhiteSpace(permission))
+                ? tokenInfo
+                : throw InvalidTokenPermissionResponse();
         }
         catch (JsonException)
         {
             throw InvalidTokenPermissionResponse();
+        }
+    }
+
+    private async Task<List<WalletBalanceResponse>> DeserializeWalletAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var wallet = await JsonSerializer.DeserializeAsync<List<WalletBalanceResponse>>(stream, JsonOptions, cancellationToken);
+            if (wallet is null || wallet.Any(balance => balance.Id is not > 0 || balance.Value is null or < 0))
+            {
+                throw InvalidWalletResponse();
+            }
+
+            return wallet;
+        }
+        catch (JsonException)
+        {
+            throw InvalidWalletResponse();
+        }
+    }
+
+    private async Task<List<CurrencyResponse>> DeserializeCurrenciesAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var currencies = await JsonSerializer.DeserializeAsync<List<CurrencyResponse>>(stream, JsonOptions, cancellationToken);
+            if (currencies is null || currencies.Any(currency => currency.Id is not > 0 || string.IsNullOrWhiteSpace(currency.Name)) || currencies.Select(currency => currency.Id!.Value).Distinct().Count() != currencies.Count)
+            {
+                throw InvalidCurrencyResponse();
+            }
+
+            return currencies;
+        }
+        catch (JsonException)
+        {
+            throw InvalidCurrencyResponse();
         }
     }
 
@@ -99,11 +189,11 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return body.Contains("invalid key", StringComparison.OrdinalIgnoreCase);
     }
 
-    private async Task<HttpResponseMessage> SendWithSingleRetryAsync(string path, CancellationToken cancellationToken)
+    private async Task<HttpResponseMessage> SendWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated = true)
     {
         for (var attempt = 0; ; attempt++)
         {
-            var response = await SendAsync(path, cancellationToken);
+            var response = await SendAsync(path, cancellationToken, authenticated);
             if (attempt > 0)
             {
                 return response;
@@ -153,20 +243,27 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return DefaultRetryDelay;
     }
 
-    private async Task<HttpResponseMessage> SendAsync(string path, CancellationToken cancellationToken)
+    private async Task<HttpResponseMessage> SendAsync(string path, CancellationToken cancellationToken, bool authenticated)
     {
         var separator = path.Contains('?') ? '&' : '?';
         using var request = new HttpRequestMessage(HttpMethod.Get, $"{path}{separator}lang={Language}&v={Uri.EscapeDataString(SchemaVersion)}");
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", options.ApiKey);
+        if (authenticated)
+        {
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", options.ApiKey);
+        }
         return await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
     }
 
     private static Gw2ConfigurationException InvalidKey() => new("GW2_API_KEY was rejected by Guild Wars 2. Check that the configured key is valid and active.");
     private static Gw2ConfigurationException InvalidAccountResponse() => new("GW2 returned an invalid account response. Try again later.");
+    private static Gw2ConfigurationException InvalidWalletResponse() => new("GW2 returned an invalid wallet response. Try again later.");
+    private static Gw2ConfigurationException InvalidCurrencyResponse() => new("GW2 returned an invalid currency response. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
 
-    private sealed record TokenInfo(List<string>? Permissions);
+    private sealed record TokenInfo(List<string?>? Permissions);
     private sealed record AccountResponse(string? Name, int? World, DateTimeOffset? Created, List<string>? Access);
+    private sealed record WalletBalanceResponse(int? Id, long? Value);
+    private sealed record CurrencyResponse(int? Id, string? Name);
 }
 
 public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
@@ -174,3 +271,6 @@ public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
 public sealed class Gw2ConfigurationException(string message) : Exception(message);
 
 public sealed record Gw2Account(string Name, int World, DateTimeOffset Created, List<string> Access);
+public sealed record Gw2Wallet(IReadOnlyList<Gw2WalletBalance> Balances, IReadOnlyList<Gw2WalletWarning> Warnings);
+public sealed record Gw2WalletBalance(int Id, string? Name, long Value);
+public sealed record Gw2WalletWarning(string Code, int CurrencyId);

@@ -17,7 +17,8 @@ builder.Services.AddHttpClient<IGw2ApiClient, Gw2ApiClient>(client =>
 builder.Services
     .AddMcpServer()
     .WithHttpTransport(options => options.Stateless = true)
-    .WithTools<GetAccountTool>();
+    .WithTools<GetAccountTool>()
+    .WithTools<GetWalletTool>();
 
 var app = builder.Build();
 

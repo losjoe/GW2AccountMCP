@@ -2,11 +2,14 @@
 
 Local, read-only Guild Wars 2 account facts over stateless Streamable HTTP MCP.
 
-## Phase 0 scope
+## Current scope
 
-The only tool is `get_account`. It validates the configured key through `/v2/tokeninfo`, requires the `account` permission, then calls `/v2/account`. It returns basic account facts and an `asOf` timestamp; it never returns token metadata or the key.
+The server exposes two tools:
 
-The accepted v1 key scopes are `account`, `wallet`, `inventories`, `characters`, `builds`, `progression`, `unlocks`, and `tradingpost`. Phase 0 uses only the `account` scope and account endpoints.
+- `get_account` validates the configured key through `/v2/tokeninfo`, requires `account`, and returns basic account facts with an `asOf` timestamp.
+- `get_wallet` requires `account` and `wallet`, retrieves `/v2/account/wallet`, and joins each canonical currency ID to its English `/v2/currencies` name. It returns `long` values, one `asOf` timestamp, and warnings that retain the ID and value when metadata is unavailable. An empty wallet is returned as an empty balance list.
+
+Neither tool returns token metadata or the key. The accepted v1 key scopes remain `account`, `wallet`, `inventories`, `characters`, `builds`, `progression`, `unlocks`, and `tradingpost`; each enabled tool validates only its required scopes.
 
 ## Configure and run
 
@@ -68,10 +71,11 @@ With the server running, use the current official Inspector CLI flow to list too
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/list
 ```
 
-Then invoke `get_account` through Inspector. Invocation needs a locally configured valid GW2 key; do not paste it into Inspector arguments or chat.
+Then invoke either tool through Inspector. Invocation needs a locally configured valid GW2 key with the tool's required scopes; do not paste it into Inspector arguments or chat.
 
 ```powershell
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_wallet --format json
 ```
 
 ## Secure MCP Tunnel and ChatGPT smoke test
@@ -82,4 +86,4 @@ Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create
 tunnel-client init --sample sample_mcp_remote_no_auth --profile gw2-account --tunnel-id <tunnel-id> --mcp-server-url http://127.0.0.1:5288/mcp
 ```
 
-Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that only `get_account` is discovered, and invoke it. Keep the launcher running while using the app.
+Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `get_account` and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.

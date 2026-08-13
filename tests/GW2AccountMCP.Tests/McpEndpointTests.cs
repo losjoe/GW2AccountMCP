@@ -16,7 +16,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_only_read_only_get_account_with_structured_output_schema()
+    public async Task Mcp_route_discovers_exactly_read_only_get_account_and_get_wallet_with_structured_output_schemas()
     {
         await InitializeAsync();
 
@@ -25,12 +25,24 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
-        var tool = Assert.Single(tools.EnumerateArray());
-        Assert.Equal("get_account", tool.GetProperty("name").GetString());
-        Assert.True(tool.GetProperty("annotations").GetProperty("readOnlyHint").GetBoolean());
-        var outputSchema = tool.GetProperty("outputSchema").GetProperty("properties");
-        Assert.True(outputSchema.TryGetProperty("name", out _));
-        Assert.True(outputSchema.TryGetProperty("asOf", out _));
+        var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
+        Assert.Equal(["get_account", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        foreach (var tool in discoveredTools)
+        {
+            var annotations = tool.GetProperty("annotations");
+            Assert.True(annotations.GetProperty("readOnlyHint").GetBoolean());
+            Assert.True(annotations.GetProperty("idempotentHint").GetBoolean());
+            Assert.False(annotations.GetProperty("openWorldHint").GetBoolean());
+            Assert.True(tool.TryGetProperty("outputSchema", out _));
+        }
+
+        var accountOutputSchema = discoveredTools[0].GetProperty("outputSchema").GetProperty("properties");
+        Assert.True(accountOutputSchema.TryGetProperty("name", out _));
+        Assert.True(accountOutputSchema.TryGetProperty("asOf", out _));
+        var walletOutputSchema = discoveredTools[1].GetProperty("outputSchema").GetProperty("properties");
+        Assert.True(walletOutputSchema.TryGetProperty("balances", out _));
+        Assert.True(walletOutputSchema.TryGetProperty("warnings", out _));
+        Assert.True(walletOutputSchema.TryGetProperty("asOf", out _));
         Assert.DoesNotContain("GW2_API_KEY", document.RootElement.GetRawText(), StringComparison.OrdinalIgnoreCase);
     }
 
@@ -63,6 +75,39 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         var payload = await ReadMcpResponseAsync(response);
 
         Assert.Contains("GW2_API_KEY", payload, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('k', 16), payload, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetWallet_returns_structured_balances_warnings_and_one_as_of()
+    {
+        await InitializeAsync();
+
+        using var response = await PostMcpAsync(5, "tools/call", new { name = "get_wallet", arguments = new { } });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var balance = Assert.Single(structured.GetProperty("balances").EnumerateArray());
+        Assert.Equal(1, balance.GetProperty("id").GetInt32());
+        Assert.Equal("Coin", balance.GetProperty("name").GetString());
+        Assert.Equal(42, balance.GetProperty("value").GetInt64());
+        Assert.Empty(structured.GetProperty("warnings").EnumerateArray());
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
+    }
+
+    [Fact]
+    public async Task GetWallet_maps_redacted_configuration_errors_to_mcp()
+    {
+        using var errorFactory = new ErrorMcpApplicationFactory();
+        using var errorClient = errorFactory.CreateClient();
+        await InitializeAsync(errorClient);
+
+        using var response = await PostMcpAsync(errorClient, 6, "tools/call", new { name = "get_wallet", arguments = new { } });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+
+        Assert.Contains("wallet permission", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(new string('k', 16), payload, StringComparison.Ordinal);
     }
 
@@ -143,12 +188,18 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     {
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Account("Example.1234", 2206, DateTimeOffset.Parse("2020-01-02T03:04:05Z"), ["GuildWars2"]));
+
+        public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2Wallet([new Gw2WalletBalance(1, "Coin", 42)], []));
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
     {
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+
+        public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required wallet permission. Create a key with the wallet permission.");
     }
 
     private sealed class FixedTimeProvider : TimeProvider

@@ -229,6 +229,149 @@ public sealed class Gw2ApiClientTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.GetAccountAsync(cancellationSource.Token));
     }
 
+    [Fact]
+    public async Task GetWalletAsync_joins_currency_names_in_wallet_order_and_uses_canonical_public_request()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","wallet"]}"""),
+            new ResponseSpec("""[{"id":2,"value":0},{"id":1,"value":42},{"id":2,"value":7}]"""),
+            new ResponseSpec("""[{"id":1,"name":"Coin"},{"id":2,"name":"Karma"}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var wallet = await client.GetWalletAsync(CancellationToken.None);
+
+        Assert.Equal([(2, "Karma", 0L), (1, "Coin", 42L), (2, "Karma", 7L)], wallet.Balances.Select(balance => (balance.Id, balance.Name, balance.Value)));
+        Assert.Empty(wallet.Warnings);
+        Assert.Equal(
+            ["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/account/wallet?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/currencies?ids=1%2C2&lang=en&v=2025-08-29T01%3A00%3A00.000Z"],
+            handler.RequestUris);
+        Assert.Equal(["Bearer " + apiKey, "Bearer " + apiKey, null], handler.AuthorizationHeaders);
+    }
+
+    [Fact]
+    public async Task GetWalletAsync_missing_or_invalid_key_stops_before_wallet_and_currency_requests()
+    {
+        var missingKeyHandler = new RecordingHandler();
+        using var missingKeyHttpClient = new HttpClient(missingKeyHandler) { BaseAddress = new Uri("https://example.test") };
+        var missingKeyClient = new Gw2ApiClient(missingKeyHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var missingKeyError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => missingKeyClient.GetWalletAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", missingKeyError.Message, StringComparison.Ordinal);
+        Assert.Empty(missingKeyHandler.RequestUris);
+
+        var apiKey = new string('k', 16);
+        var invalidKeyHandler = new RecordingHandler("Invalid key", HttpStatusCode.Unauthorized, "Invalid key", HttpStatusCode.Unauthorized);
+        using var invalidKeyHttpClient = new HttpClient(invalidKeyHandler) { BaseAddress = new Uri("https://example.test") };
+        var invalidKeyClient = new Gw2ApiClient(invalidKeyHttpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var invalidKeyError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => invalidKeyClient.GetWalletAsync(CancellationToken.None));
+
+        Assert.DoesNotContain(apiKey, invalidKeyError.Message, StringComparison.Ordinal);
+        Assert.Equal(2, invalidKeyHandler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetWalletAsync_rejects_malformed_token_permissions_before_downstream_calls()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("{malformed");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetWalletAsync(CancellationToken.None));
+
+        Assert.Contains("token-permission response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("{\"permissions\":[\"account\"]}", "wallet permission")]
+    [InlineData("{\"permissions\":[\"wallet\"]}", "account permission")]
+    public async Task GetWalletAsync_requires_each_operation_specific_permission_before_downstream_calls(string tokenResponse, string requiredPermission)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(new ResponseSpec(tokenResponse));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetWalletAsync(CancellationToken.None));
+
+        Assert.Contains(requiredPermission, error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetWalletAsync_empty_wallet_skips_currency_metadata()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","wallet"]}""", "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var wallet = await client.GetWalletAsync(CancellationToken.None);
+
+        Assert.Empty(wallet.Balances);
+        Assert.Empty(wallet.Warnings);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetWalletAsync_retains_balance_and_returns_bounded_warning_when_currency_metadata_is_missing()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","wallet"]}""",
+            """[{"id":1,"value":99},{"id":2,"value":0}]""",
+            new ResponseSpec("""[{"id":1,"name":"Coin"}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var wallet = await client.GetWalletAsync(CancellationToken.None);
+
+        Assert.Equal([(1, "Coin", 99L), (2, null, 0L)], wallet.Balances.Select(balance => (balance.Id, balance.Name, balance.Value)));
+        var warning = Assert.Single(wallet.Warnings);
+        Assert.Equal("currency_metadata_missing", warning.Code);
+        Assert.Equal(2, warning.CurrencyId);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("[{}]")]
+    [InlineData("[{\"id\":0,\"value\":1}]")]
+    [InlineData("[{\"id\":1,\"value\":-1}]")]
+    public async Task GetWalletAsync_rejects_malformed_or_invalid_wallet_responses(string walletResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("""{"permissions":["account","wallet"]}""", walletResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetWalletAsync(CancellationToken.None));
+
+        Assert.Contains("wallet response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("[{}]")]
+    [InlineData("[{\"id\":0,\"name\":\"Coin\"}]")]
+    public async Task GetWalletAsync_rejects_malformed_or_invalid_currency_responses(string currencyResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("""{"permissions":["account","wallet"]}""", """[{"id":1,"value":0}]""", currencyResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetWalletAsync(CancellationToken.None));
+
+        Assert.Contains("currency response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+    }
+
     private sealed record ResponseSpec(string Content, HttpStatusCode StatusCode = HttpStatusCode.OK, TimeSpan? RetryAfter = null);
 
     private sealed class ImmediateTimeProvider : TimeProvider
