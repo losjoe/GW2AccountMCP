@@ -948,7 +948,301 @@ public sealed class Gw2ApiClientTests
         Assert.Equal(2, httpHandler.RequestUris.Count);
     }
 
-    private sealed record ResponseSpec(string Content, HttpStatusCode StatusCode = HttpStatusCode.OK, TimeSpan? RetryAfter = null);
+    [Fact]
+    public async Task GetCurrentSellsAsync_missing_key_is_actionable_and_makes_no_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("{\"permissions\":[\"tradingpost\"]}", "account permission")]
+    [InlineData("{\"permissions\":[\"account\"]}", "tradingpost permission")]
+    public async Task GetCurrentSellsAsync_requires_each_permission_before_transaction_requests(string tokenResponse, string requiredPermission)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(tokenResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains(requiredPermission, error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_normalizes_one_complete_page_without_aggregating_or_reordering()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(
+                """[{"id":7001,"item_id":301,"price":4294967295,"quantity":2,"created":"2026-01-02T03:04:05Z"},{"id":7002,"item_id":301,"price":4,"quantity":4294967296,"created":"2026-02-03T04:05:06+00:00"}]""",
+                Headers: PaginationHeaders(resultCount: "2", resultTotal: "2")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var sells = await client.GetCurrentSellsAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [
+                (7001L, 301L, 4294967295L, 2L, DateTimeOffset.Parse("2026-01-02T03:04:05Z")),
+                (7002L, 301L, 4L, 4294967296L, DateTimeOffset.Parse("2026-02-03T04:05:06Z"))
+            ],
+            sells.Orders.Select(order => (order.Id, order.ItemId, order.Price, order.Quantity, order.Created)));
+        Assert.Equal(
+            [
+                "/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/commerce/transactions/current/sells?page=0&page_size=200&lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+            ],
+            handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_exhausts_every_advertised_page_once_in_order()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(CurrentSellPage(1, 200), Headers: PaginationHeaders(pageTotal: "3", resultCount: "200", resultTotal: "401")),
+            new ResponseSpec(CurrentSellPage(201, 200), Headers: PaginationHeaders(pageTotal: "3", resultCount: "200", resultTotal: "401")),
+            new ResponseSpec(CurrentSellPage(401, 1), Headers: PaginationHeaders(pageTotal: "3", resultCount: "1", resultTotal: "401")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var sells = await client.GetCurrentSellsAsync(CancellationToken.None);
+
+        Assert.Equal(401, sells.Orders.Count);
+        Assert.Equal(7401L, sells.Orders[^1].Id);
+        Assert.Equal(
+            [
+                "/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/commerce/transactions/current/sells?page=0&page_size=200&lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/commerce/transactions/current/sells?page=1&page_size=200&lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/commerce/transactions/current/sells?page=2&page_size=200&lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+            ],
+            handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_accepts_only_a_consistent_empty_result()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec("[]", Headers: PaginationHeaders(pageTotal: "0", resultCount: "0", resultTotal: "0")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var sells = await client.GetCurrentSellsAsync(CancellationToken.None);
+
+        Assert.Empty(sells.Orders);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<string> InvalidCurrentSellResponses => new()
+    {
+        "{malformed",
+        "null",
+        "{}",
+        "[null]",
+        "[{}]",
+        "[{\"id\":0,\"item_id\":1,\"price\":1,\"quantity\":1,\"created\":\"2026-01-02T03:04:05Z\"}]",
+        "[{\"id\":1,\"item_id\":0,\"price\":1,\"quantity\":1,\"created\":\"2026-01-02T03:04:05Z\"}]",
+        "[{\"id\":1,\"item_id\":1,\"price\":0,\"quantity\":1,\"created\":\"2026-01-02T03:04:05Z\"}]",
+        "[{\"id\":1,\"item_id\":1,\"price\":1,\"quantity\":0,\"created\":\"2026-01-02T03:04:05Z\"}]",
+        "[{\"id\":1,\"item_id\":1,\"price\":1,\"quantity\":1}]",
+        "[{\"id\":1,\"item_id\":1,\"price\":1,\"quantity\":1,\"created\":\"invalid\"}]",
+        "[{\"id\":\"1\",\"item_id\":1,\"price\":1,\"quantity\":1,\"created\":\"2026-01-02T03:04:05Z\"}]"
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidCurrentSellResponses))]
+    public async Task GetCurrentSellsAsync_rejects_malformed_or_invalid_rows_without_exposing_content(string sellsResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(sellsResponse, Headers: PaginationHeaders(resultCount: "1", resultTotal: "1")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains("current-sells response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(sellsResponse, error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("X-Page-Size")]
+    [InlineData("X-Page-Total")]
+    [InlineData("X-Result-Count")]
+    [InlineData("X-Result-Total")]
+    public async Task GetCurrentSellsAsync_rejects_missing_pagination_headers(string missingHeader)
+    {
+        var headers = PaginationHeaders(resultCount: "1", resultTotal: "1");
+        headers.Remove(missingHeader);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(CurrentSellPage(1, 1), Headers: headers));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains("pagination", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("X-Page-Size", "not-a-number")]
+    [InlineData("X-Page-Size", "0")]
+    [InlineData("X-Page-Size", "199")]
+    [InlineData("X-Page-Total", "-1")]
+    [InlineData("X-Result-Count", "-1")]
+    [InlineData("X-Result-Total", "-1")]
+    public async Task GetCurrentSellsAsync_rejects_malformed_or_invalid_pagination_values(string headerName, string headerValue)
+    {
+        var headers = PaginationHeaders(resultCount: "1", resultTotal: "1");
+        headers[headerName] = headerValue;
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(CurrentSellPage(1, 1), Headers: headers));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains("pagination", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_rejects_contradictory_page_metadata()
+    {
+        var handlers = new[]
+        {
+            new RecordingHandler(
+                new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+                new ResponseSpec(CurrentSellPage(1, 1), Headers: PaginationHeaders(resultCount: "2", resultTotal: "2"))),
+            new RecordingHandler(
+                new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+                new ResponseSpec(CurrentSellPage(1, 1), Headers: PaginationHeaders(pageTotal: "2", resultCount: "1", resultTotal: "1"))),
+            new RecordingHandler(
+                new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+                new ResponseSpec("[]", Headers: PaginationHeaders(pageTotal: "1", resultCount: "0", resultTotal: "0")))
+        };
+
+        foreach (var handler in handlers)
+        {
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+            var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+            Assert.Contains("pagination", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_rejects_changing_pagination_metadata_and_stops()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(CurrentSellPage(1, 200), Headers: PaginationHeaders(pageTotal: "2", resultCount: "200", resultTotal: "201")),
+            new ResponseSpec(CurrentSellPage(201, 1), Headers: PaginationHeaders(pageTotal: "2", resultCount: "1", resultTotal: "202")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains("pagination", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_rejects_partial_or_failed_later_page_without_requesting_more()
+    {
+        foreach (var failureStatus in new[] { HttpStatusCode.PartialContent, HttpStatusCode.InternalServerError })
+        {
+            var handler = new RecordingHandler(
+                new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+                new ResponseSpec(CurrentSellPage(1, 200), Headers: PaginationHeaders(pageTotal: "3", resultCount: "200", resultTotal: "401")),
+                new ResponseSpec("private transaction content", failureStatus, Headers: PaginationHeaders(pageTotal: "3", resultCount: "200", resultTotal: "401")));
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+            var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+            Assert.Contains($"HTTP {(int)failureStatus}", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("private transaction content", error.Message, StringComparison.Ordinal);
+            Assert.Equal(3, handler.RequestUris.Count);
+            Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("page=2", StringComparison.Ordinal));
+        }
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_retries_only_the_failed_page_without_duplicating_rows()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec(CurrentSellPage(1, 200), Headers: PaginationHeaders(pageTotal: "2", resultCount: "200", resultTotal: "201")),
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec(CurrentSellPage(201, 1), Headers: PaginationHeaders(pageTotal: "2", resultCount: "1", resultTotal: "201")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var sells = await client.GetCurrentSellsAsync(CancellationToken.None);
+
+        Assert.Equal(201, sells.Orders.Count);
+        Assert.Equal(1, handler.RequestUris.Count(uri => uri.Contains("page=0", StringComparison.Ordinal)));
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.Contains("page=1", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task GetCurrentSellsAsync_maps_auth_failure_without_exposing_response_content()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec("private transaction content", HttpStatusCode.Forbidden));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCurrentSellsAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private transaction content", error.Message, StringComparison.Ordinal);
+    }
+
+    private static Dictionary<string, string> PaginationHeaders(
+        string pageSize = "200",
+        string pageTotal = "1",
+        string resultCount = "1",
+        string resultTotal = "1") => new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["X-Page-Size"] = pageSize,
+        ["X-Page-Total"] = pageTotal,
+        ["X-Result-Count"] = resultCount,
+        ["X-Result-Total"] = resultTotal
+    };
+
+    private static string CurrentSellPage(int firstOffset, int count) =>
+        "[" + string.Join(',', Enumerable.Range(firstOffset, count).Select(offset =>
+            $$"""{"id":{{7000L + offset}},"item_id":{{300L + offset}},"price":{{10L + offset}},"quantity":{{20L + offset}},"created":"2026-01-02T03:04:05Z"}""")) + "]";
+
+    private sealed record ResponseSpec(
+        string Content,
+        HttpStatusCode StatusCode = HttpStatusCode.OK,
+        TimeSpan? RetryAfter = null,
+        IReadOnlyDictionary<string, string>? Headers = null);
 
     private sealed class ImmediateTimeProvider : TimeProvider
     {
@@ -992,6 +1286,14 @@ public sealed class Gw2ApiClientTests
             if (response.RetryAfter is { } retryAfter)
             {
                 message.Headers.RetryAfter = new System.Net.Http.Headers.RetryConditionHeaderValue(retryAfter);
+            }
+
+            if (response.Headers is not null)
+            {
+                foreach (var (name, value) in response.Headers)
+                {
+                    message.Headers.TryAddWithoutValidation(name, value);
+                }
             }
 
             return Task.FromResult(message);

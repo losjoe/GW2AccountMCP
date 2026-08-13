@@ -1,6 +1,8 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Globalization;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace GW2AccountMCP.Gw2;
 
@@ -11,12 +13,14 @@ public interface IGw2ApiClient
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
+    Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
 {
     public const string SchemaVersion = "2025-08-29T01:00:00.000Z";
     private const string Language = "en";
+    private const int CurrentSellsPageSize = 200;
     private static readonly TimeSpan DefaultRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -247,6 +251,62 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             delivery.Items!.Select(item => new Gw2TradingPostDeliveryItem(item!.Id!.Value, item.Count!.Value)).ToArray());
     }
 
+    public async Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        await ValidatePermissionsAsync(["account", "tradingpost"], cancellationToken);
+
+        var orders = new List<Gw2CurrentSellOrder>();
+        CurrentSellsPagination? expectedPagination = null;
+        for (var page = 0; ; page++)
+        {
+            using var response = await SendWithSingleRetryAsync(
+                $"/v2/commerce/transactions/current/sells?page={page}&page_size={CurrentSellsPageSize}",
+                cancellationToken);
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                throw InvalidKey();
+            }
+
+            if (response.StatusCode != HttpStatusCode.OK)
+            {
+                throw new Gw2ConfigurationException($"GW2 current-sells request failed with HTTP {(int)response.StatusCode}. Try again later.");
+            }
+
+            var pagination = DeserializeCurrentSellsPagination(response.Headers, page);
+            if (expectedPagination is not null
+                && (pagination.PageSize != expectedPagination.PageSize
+                    || pagination.PageTotal != expectedPagination.PageTotal
+                    || pagination.ResultTotal != expectedPagination.ResultTotal))
+            {
+                throw InvalidCurrentSellsPagination();
+            }
+
+            expectedPagination ??= pagination;
+            var pageOrders = await DeserializeCurrentSellsAsync(response, cancellationToken);
+            if (pageOrders.Count != pagination.ResultCount)
+            {
+                throw InvalidCurrentSellsPagination();
+            }
+
+            orders.AddRange(pageOrders.Select(order => new Gw2CurrentSellOrder(
+                order.Id!.Value,
+                order.ItemId!.Value,
+                order.Price!.Value,
+                order.Quantity!.Value,
+                order.Created!.Value)));
+
+            if (pagination.PageTotal == 0 || page == pagination.PageTotal - 1)
+            {
+                return new Gw2CurrentSells(orders);
+            }
+        }
+    }
+
     private async Task ValidatePermissionsAsync(IReadOnlyList<string> requiredPermissions, CancellationToken cancellationToken)
     {
         using var response = await SendWithSingleRetryAsync("/v2/tokeninfo", cancellationToken);
@@ -453,6 +513,74 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private static CurrentSellsPagination DeserializeCurrentSellsPagination(HttpResponseHeaders headers, int requestedPage)
+    {
+        var pageSize = ParsePaginationHeader(headers, "X-Page-Size");
+        var pageTotal = ParsePaginationHeader(headers, "X-Page-Total");
+        var resultCount = ParsePaginationHeader(headers, "X-Result-Count");
+        var resultTotal = ParsePaginationHeader(headers, "X-Result-Total");
+        if (pageSize != CurrentSellsPageSize
+            || pageTotal > int.MaxValue
+            || resultCount > pageSize
+            || (resultTotal == 0 && (requestedPage != 0 || pageTotal != 0 || resultCount != 0))
+            || (resultTotal > 0
+                && (pageTotal == 0
+                    || requestedPage >= pageTotal
+                    || pageTotal != ((resultTotal - 1) / pageSize) + 1
+                    || resultCount != (requestedPage == pageTotal - 1
+                        ? resultTotal - ((pageTotal - 1) * pageSize)
+                        : pageSize))))
+        {
+            throw InvalidCurrentSellsPagination();
+        }
+
+        return new CurrentSellsPagination(pageSize, (int)pageTotal, resultCount, resultTotal);
+    }
+
+    private static long ParsePaginationHeader(HttpResponseHeaders headers, string name)
+    {
+        if (!headers.TryGetValues(name, out var values))
+        {
+            throw InvalidCurrentSellsPagination();
+        }
+
+        var valueArray = values.ToArray();
+        if (valueArray.Length != 1
+            || !long.TryParse(valueArray[0], NumberStyles.None, CultureInfo.InvariantCulture, out var value)
+            || value < 0)
+        {
+            throw InvalidCurrentSellsPagination();
+        }
+
+        return value;
+    }
+
+    private async Task<List<CurrentSellResponse>> DeserializeCurrentSellsAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var orders = await JsonSerializer.DeserializeAsync<List<CurrentSellResponse?>>(stream, JsonOptions, cancellationToken);
+            if (orders is null
+                || orders.Any(order => order is null
+                    || order.Id is not > 0
+                    || order.ItemId is not > 0
+                    || order.Price is not > 0
+                    || order.Quantity is not > 0
+                    || order.Created is null
+                    || order.Created.Value == default))
+            {
+                throw InvalidCurrentSellsResponse();
+            }
+
+            return orders.Select(order => order!).ToList();
+        }
+        catch (JsonException)
+        {
+            throw InvalidCurrentSellsResponse();
+        }
+    }
+
     private static async Task<bool> IsInvalidKeyResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -534,6 +662,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidCharacterListResponse() => new("GW2 returned an invalid character-list response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterInventoryResponse() => new("GW2 returned an invalid character-inventory response. Try again later.");
     private static Gw2ConfigurationException InvalidTradingPostDeliveryResponse() => new("GW2 returned an invalid delivery response. Try again later.");
+    private static Gw2ConfigurationException InvalidCurrentSellsResponse() => new("GW2 returned an invalid current-sells response. Try again later.");
+    private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
 
     private sealed record TokenInfo(List<string?>? Permissions);
@@ -546,6 +676,13 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private sealed record CharacterBagResponse(int? Id, int? Size, List<InventoryStackResponse?>? Inventory);
     private sealed record TradingPostDeliveryResponse(long? Coins, List<TradingPostDeliveryItemResponse?>? Items);
     private sealed record TradingPostDeliveryItemResponse(long? Id, long? Count);
+    private sealed record CurrentSellResponse(
+        long? Id,
+        [property: JsonPropertyName("item_id")] long? ItemId,
+        long? Price,
+        long? Quantity,
+        DateTimeOffset? Created);
+    private sealed record CurrentSellsPagination(long PageSize, int PageTotal, long ResultCount, long ResultTotal);
 }
 
 public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
@@ -562,6 +699,8 @@ public sealed record Gw2CharacterBags(IReadOnlyList<Gw2CharacterBagStack> Stacks
 public sealed record Gw2CharacterBagStack(int Id, long Count, string Character, int BagIndex, int SlotIndex);
 public sealed record Gw2TradingPostDelivery(long Coins, IReadOnlyList<Gw2TradingPostDeliveryItem> Items);
 public sealed record Gw2TradingPostDeliveryItem(long Id, long Count);
+public sealed record Gw2CurrentSells(IReadOnlyList<Gw2CurrentSellOrder> Orders);
+public sealed record Gw2CurrentSellOrder(long Id, long ItemId, long Price, long Quantity, DateTimeOffset Created);
 public enum Gw2StorageSource
 {
     Bank,

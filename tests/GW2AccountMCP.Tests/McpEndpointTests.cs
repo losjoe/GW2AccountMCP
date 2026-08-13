@@ -200,6 +200,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2TradingPostDelivery(0, []));
+
+        public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2CurrentSells([]));
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -217,6 +220,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required characters permission. Create a key with the characters permission.");
 
         public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required tradingpost permission. Create a key with the tradingpost permission.");
+
+        public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required tradingpost permission. Create a key with the tradingpost permission.");
     }
 
