@@ -372,6 +372,192 @@ public sealed class Gw2ApiClientTests
         Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task GetAccountStorageAsync_normalizes_all_sources_without_aggregating_stacks()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","inventories"]}""",
+            """[null,{"id":11,"count":2},{"id":11,"count":3}]""",
+            """[{"id":11,"category":1,"count":0},{"id":12,"category":2,"count":4}]""",
+            """[{"id":11,"count":1},null,{"id":13,"count":5}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var storage = await client.GetAccountStorageAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [
+                (11, 2L, Gw2StorageSource.Bank, (int?)1),
+                (11, 3L, Gw2StorageSource.Bank, (int?)2),
+                (11, 0L, Gw2StorageSource.MaterialStorage, null),
+                (12, 4L, Gw2StorageSource.MaterialStorage, null),
+                (11, 1L, Gw2StorageSource.SharedInventory, (int?)0),
+                (13, 5L, Gw2StorageSource.SharedInventory, (int?)2)
+            ],
+            storage.Stacks.Select(stack => (stack.Id, stack.Count, stack.Source, stack.SlotIndex)));
+        Assert.Equal(
+            [
+                "/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/account/bank?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/account/materials?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/account/inventory?lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+            ],
+            handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
+    [Fact]
+    public async Task GetAccountStorageAsync_missing_key_is_actionable_and_makes_no_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountStorageAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("{\"permissions\":[\"account\"]}", "inventories permission")]
+    [InlineData("{\"permissions\":[\"inventories\"]}", "account permission")]
+    public async Task GetAccountStorageAsync_requires_each_permission_before_storage_requests(string tokenResponse, string requiredPermission)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(tokenResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountStorageAsync(CancellationToken.None));
+
+        Assert.Contains(requiredPermission, error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetAccountStorageAsync_accepts_empty_sources()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","inventories"]}""", "[]", "[]", "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var storage = await client.GetAccountStorageAsync(CancellationToken.None);
+
+        Assert.Empty(storage.Stacks);
+        Assert.Equal(4, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("[{}]")]
+    [InlineData("[{\"id\":0,\"count\":1}]")]
+    [InlineData("[{\"id\":1,\"count\":0}]")]
+    [InlineData("[{\"id\":1,\"count\":-1}]")]
+    public async Task GetAccountStorageAsync_rejects_invalid_bank_responses(string bankResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("""{"permissions":["account","inventories"]}""", bankResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountStorageAsync(CancellationToken.None));
+
+        Assert.Contains("bank response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(bankResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("[null]")]
+    [InlineData("[{}]")]
+    [InlineData("[{\"id\":1,\"count\":0}]")]
+    [InlineData("[{\"id\":0,\"category\":1,\"count\":0}]")]
+    [InlineData("[{\"id\":1,\"category\":1,\"count\":-1}]")]
+    [InlineData("[{\"id\":1,\"category\":1,\"count\":0},{\"id\":1,\"category\":1,\"count\":2}]")]
+    public async Task GetAccountStorageAsync_rejects_invalid_material_responses(string materialResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("""{"permissions":["account","inventories"]}""", "[]", materialResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountStorageAsync(CancellationToken.None));
+
+        Assert.Contains("material-storage response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(materialResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("[{}]")]
+    [InlineData("[{\"id\":0,\"count\":1}]")]
+    [InlineData("[{\"id\":1,\"count\":0}]")]
+    [InlineData("[{\"id\":1,\"count\":-1}]")]
+    public async Task GetAccountStorageAsync_rejects_invalid_shared_inventory_responses(string inventoryResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("""{"permissions":["account","inventories"]}""", "[]", "[]", inventoryResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountStorageAsync(CancellationToken.None));
+
+        Assert.Contains("shared-inventory response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(inventoryResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(4, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetAccountStorageAsync_source_failure_is_total_and_does_not_continue()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","inventories"]}"""),
+            new ResponseSpec("[]"),
+            new ResponseSpec("account data must not appear in the error", HttpStatusCode.InternalServerError));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountStorageAsync(CancellationToken.None));
+
+        Assert.Contains("material-storage request failed with HTTP 500", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("account data", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetAccountStorageAsync_reuses_authenticated_single_retry_for_storage_sources()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","inventories"]}"""),
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec("[]"),
+            new ResponseSpec("[]"),
+            new ResponseSpec("[]"));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var storage = await client.GetAccountStorageAsync(CancellationToken.None);
+
+        Assert.Empty(storage.Stacks);
+        Assert.Equal(5, handler.RequestUris.Count);
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.StartsWith("/v2/account/bank?", StringComparison.Ordinal)));
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
     private sealed record ResponseSpec(string Content, HttpStatusCode StatusCode = HttpStatusCode.OK, TimeSpan? RetryAfter = null);
 
     private sealed class ImmediateTimeProvider : TimeProvider

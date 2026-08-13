@@ -191,6 +191,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Wallet([new Gw2WalletBalance(1, "Coin", 42)], []));
+
+        public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2AccountStorage([]));
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -200,6 +203,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required wallet permission. Create a key with the wallet permission.");
+
+        public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required inventories permission. Create a key with the inventories permission.");
     }
 
     private sealed class FixedTimeProvider : TimeProvider
