@@ -14,6 +14,7 @@ public interface IGw2ApiClient
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
     Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken);
+    Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
@@ -21,6 +22,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     public const string SchemaVersion = "2025-08-29T01:00:00.000Z";
     private const string Language = "en";
     private const int CurrentSellsPageSize = 200;
+    private const int MaximumItemBatchSize = 200;
     private static readonly TimeSpan DefaultRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -307,6 +309,40 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    public async Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(itemIds);
+        if (itemIds.Count is 0 or > MaximumItemBatchSize
+            || itemIds.Any(id => id <= 0)
+            || itemIds.Distinct().Count() != itemIds.Count)
+        {
+            throw new ArgumentException("Item IDs must contain 1 to 200 unique positive values.", nameof(itemIds));
+        }
+
+        using var response = await SendWithSingleRetryAsync(
+            $"/v2/items?ids={Uri.EscapeDataString(string.Join(',', itemIds))}",
+            cancellationToken,
+            authenticated: false);
+        if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent)
+        {
+            throw new Gw2ConfigurationException($"GW2 item metadata request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        var requestedIds = itemIds.ToHashSet();
+        var itemRows = await DeserializeItemsAsync(response, requestedIds, cancellationToken);
+        var itemsById = itemRows.ToDictionary(item => item.Id!.Value);
+        var missingItemIds = itemIds.Where(id => !itemsById.ContainsKey(id)).ToArray();
+        if ((response.StatusCode == HttpStatusCode.OK && missingItemIds.Length != 0)
+            || (response.StatusCode == HttpStatusCode.PartialContent && (itemRows.Count == 0 || missingItemIds.Length == 0)))
+        {
+            throw InvalidItemMetadataResponse();
+        }
+
+        return new Gw2Items(
+            itemIds.Where(itemsById.ContainsKey).Select(id => new Gw2Item(id, itemsById[id].Name!)).ToArray(),
+            missingItemIds);
+    }
+
     private async Task ValidatePermissionsAsync(IReadOnlyList<string> requiredPermissions, CancellationToken cancellationToken)
     {
         using var response = await SendWithSingleRetryAsync("/v2/tokeninfo", cancellationToken);
@@ -581,6 +617,33 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private async Task<List<ItemResponse>> DeserializeItemsAsync(
+        HttpResponseMessage response,
+        IReadOnlySet<long> requestedIds,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var items = await JsonSerializer.DeserializeAsync<List<ItemResponse?>>(stream, JsonOptions, cancellationToken);
+            if (items is null
+                || items.Any(item => item is null
+                    || item.Id is not > 0
+                    || !requestedIds.Contains(item.Id.Value)
+                    || string.IsNullOrWhiteSpace(item.Name))
+                || items.Select(item => item!.Id!.Value).Distinct().Count() != items.Count)
+            {
+                throw InvalidItemMetadataResponse();
+            }
+
+            return items.Select(item => item!).ToList();
+        }
+        catch (JsonException)
+        {
+            throw InvalidItemMetadataResponse();
+        }
+    }
+
     private static async Task<bool> IsInvalidKeyResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -664,6 +727,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidTradingPostDeliveryResponse() => new("GW2 returned an invalid delivery response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsResponse() => new("GW2 returned an invalid current-sells response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
+    private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
 
     private sealed record TokenInfo(List<string?>? Permissions);
@@ -683,6 +747,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         long? Quantity,
         DateTimeOffset? Created);
     private sealed record CurrentSellsPagination(long PageSize, int PageTotal, long ResultCount, long ResultTotal);
+    private sealed record ItemResponse(long? Id, string? Name);
 }
 
 public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
@@ -701,6 +766,8 @@ public sealed record Gw2TradingPostDelivery(long Coins, IReadOnlyList<Gw2Trading
 public sealed record Gw2TradingPostDeliveryItem(long Id, long Count);
 public sealed record Gw2CurrentSells(IReadOnlyList<Gw2CurrentSellOrder> Orders);
 public sealed record Gw2CurrentSellOrder(long Id, long ItemId, long Price, long Quantity, DateTimeOffset Created);
+public sealed record Gw2Items(IReadOnlyList<Gw2Item> Items, IReadOnlyList<long> MissingItemIds);
+public sealed record Gw2Item(long Id, string Name);
 public enum Gw2StorageSource
 {
     Bank,

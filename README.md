@@ -4,12 +4,17 @@ Local, read-only Guild Wars 2 account facts over stateless Streamable HTTP MCP.
 
 ## Current scope
 
-The server exposes two tools:
+The server exposes three tools:
 
 - `get_account` validates the configured key through `/v2/tokeninfo`, requires `account`, and returns basic account facts with an `asOf` timestamp.
 - `get_wallet` requires `account` and `wallet`, retrieves `/v2/account/wallet`, and joins each canonical currency ID to its English `/v2/currencies` name. It returns `long` values, one `asOf` timestamp, and warnings that retain the ID and value when metadata is unavailable. An empty wallet is returned as an empty balance list.
+- `get_account_holdings` accepts separate optional `itemIds` and `currencyIds` arrays, requires at least one ID, and permits at most 20 combined positive IDs with no duplicates within either array. It preserves caller order and treats item and currency IDs as separate canonical namespaces, so the same numeric ID may appear once in each array.
 
-Neither tool returns token metadata or the key. The accepted v1 key scopes remain `account`, `wallet`, `inventories`, `characters`, `builds`, `progression`, `unlocks`, and `tradingpost`; each enabled tool validates only its required scopes.
+`get_account_holdings` queries only the sources relevant to its inputs. Currency requests require `account` and `wallet`. Item requests use bank, material storage, and shared inventory (`account`, `inventories`); every character bag (`account`, `characters`, `inventories`); and Trading Post delivery and current sells (`account`, `tradingpost`). English item names are requested only for the supplied item IDs from the public `/v2/items` endpoint.
+
+Holdings results distinguish `onHand`, `inTradingPostDelivery`, `listedForSale`, and `ownedTotal`. A successfully exhausted source contributes an authoritative value, including zero. A failed source or absent wallet balance produces a nullable quantity, explicit `unavailableLocations` or warning evidence, and `isComplete: false`; a known partial subtotal is never presented as a complete total. Item metadata failure leaves canonical IDs and known quantities intact with a null name and warning.
+
+No tool returns token metadata or the key. The accepted v1 key scopes remain `account`, `wallet`, `inventories`, `characters`, `builds`, `progression`, `unlocks`, and `tradingpost`; each enabled tool validates only its required scopes.
 
 ## Configure and run
 
@@ -71,14 +76,17 @@ With the server running, use the current official Inspector CLI flow to list too
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/list
 ```
 
-Then invoke either tool through Inspector. Invocation needs a locally configured valid GW2 key with the tool's required scopes; do not paste it into Inspector arguments or chat.
+Then invoke a tool through Inspector. Invocation needs a locally configured valid GW2 key with the tool's required scopes; do not paste it into Inspector arguments or chat. Holdings accepts canonical IDs only, not names; item-name search remains future work.
 
 ```powershell
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_wallet --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account_holdings --tool-args-json '{"itemIds":[101,202],"currencyIds":[3]}' --format json
 ```
 
 ## Secure MCP Tunnel and ChatGPT smoke test
+
+The holdings IDs above are placeholders only. Confirm the current Inspector argument syntax with `npx @modelcontextprotocol/inspector --help` if the installed CLI changes.
 
 Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create tunnel resources until local checks pass. Download `tunnel-client` from the current official latest release; do not pin a stale client version. Start with `tunnel-client help quickstart`, then initialize a named profile using the tunnel ID shown by Platform:
 
@@ -86,4 +94,4 @@ Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create
 tunnel-client init --sample sample_mcp_remote_no_auth --profile gw2-account --tunnel-id <tunnel-id> --mcp-server-url http://127.0.0.1:5288/mcp
 ```
 
-Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `get_account` and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.
+Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `get_account`, `get_wallet`, and `get_account_holdings` are discovered, and invoke the desired tool. Keep the launcher running while using the app.

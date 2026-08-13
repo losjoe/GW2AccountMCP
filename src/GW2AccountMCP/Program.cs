@@ -18,6 +18,7 @@ builder.Services
     .AddMcpServer()
     .WithHttpTransport(options => options.Stateless = true)
     .WithTools<GetAccountTool>()
+    .WithTools<GetAccountHoldingsTool>()
     .WithTools<GetWalletTool>();
 
 var app = builder.Build();

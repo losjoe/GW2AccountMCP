@@ -16,7 +16,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_read_only_get_account_and_get_wallet_with_structured_output_schemas()
+    public async Task Mcp_route_discovers_exactly_three_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -26,7 +26,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["get_account", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["get_account", "get_account_holdings", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -39,7 +39,20 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         var accountOutputSchema = discoveredTools[0].GetProperty("outputSchema").GetProperty("properties");
         Assert.True(accountOutputSchema.TryGetProperty("name", out _));
         Assert.True(accountOutputSchema.TryGetProperty("asOf", out _));
-        var walletOutputSchema = discoveredTools[1].GetProperty("outputSchema").GetProperty("properties");
+        var holdingsInputSchema = discoveredTools[1].GetProperty("inputSchema").GetProperty("properties");
+        Assert.True(holdingsInputSchema.TryGetProperty("itemIds", out _));
+        Assert.True(holdingsInputSchema.TryGetProperty("currencyIds", out _));
+        var holdingsOutputSchema = discoveredTools[1].GetProperty("outputSchema").GetProperty("properties");
+        Assert.True(holdingsOutputSchema.TryGetProperty("items", out _));
+        Assert.True(holdingsOutputSchema.TryGetProperty("currencies", out _));
+        Assert.True(holdingsOutputSchema.TryGetProperty("isComplete", out _));
+        Assert.True(holdingsOutputSchema.TryGetProperty("queriedLocations", out _));
+        Assert.True(holdingsOutputSchema.TryGetProperty("unavailableLocations", out _));
+        Assert.True(holdingsOutputSchema.TryGetProperty("warnings", out _));
+        Assert.True(holdingsOutputSchema.TryGetProperty("asOf", out _));
+        Assert.DoesNotContain("key", holdingsOutputSchema.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", holdingsOutputSchema.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        var walletOutputSchema = discoveredTools[2].GetProperty("outputSchema").GetProperty("properties");
         Assert.True(walletOutputSchema.TryGetProperty("balances", out _));
         Assert.True(walletOutputSchema.TryGetProperty("warnings", out _));
         Assert.True(walletOutputSchema.TryGetProperty("asOf", out _));
@@ -109,6 +122,33 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         Assert.Contains("wallet permission", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(new string('k', 16), payload, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetAccountHoldings_returns_safe_structured_complete_aggregation()
+    {
+        await InitializeAsync();
+
+        using var response = await PostMcpAsync(7, "tools/call", new
+        {
+            name = "get_account_holdings",
+            arguments = new { itemIds = new[] { 101L }, currencyIds = new[] { 1 } }
+        });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+        using var document = JsonDocument.Parse(payload);
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var item = Assert.Single(structured.GetProperty("items").EnumerateArray());
+        Assert.Equal(101, item.GetProperty("id").GetInt64());
+        Assert.Equal(15, item.GetProperty("ownedTotal").GetInt64());
+        var currency = Assert.Single(structured.GetProperty("currencies").EnumerateArray());
+        Assert.Equal(1, currency.GetProperty("id").GetInt32());
+        Assert.Equal(42, currency.GetProperty("ownedTotal").GetInt64());
+        Assert.True(structured.GetProperty("isComplete").GetBoolean());
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
+        Assert.DoesNotContain("GW2_API_KEY", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("tokeninfo", payload, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -193,16 +233,19 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             Task.FromResult(new Gw2Wallet([new Gw2WalletBalance(1, "Coin", 42)], []));
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(new Gw2AccountStorage([]));
+            Task.FromResult(new Gw2AccountStorage([new Gw2StorageStack(101, 2, Gw2StorageSource.Bank, 0)]));
 
         public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(new Gw2CharacterBags([]));
+            Task.FromResult(new Gw2CharacterBags([new Gw2CharacterBagStack(101, 3, "Synthetic Hero", 0, 0)]));
 
         public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(new Gw2TradingPostDelivery(0, []));
+            Task.FromResult(new Gw2TradingPostDelivery(0, [new Gw2TradingPostDeliveryItem(101, 4)]));
 
         public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) =>
-            Task.FromResult(new Gw2CurrentSells([]));
+            Task.FromResult(new Gw2CurrentSells([new Gw2CurrentSellOrder(1, 101, 999, 6, DateTimeOffset.Parse("2026-01-01T00:00:00Z"))]));
+
+        public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2Items([new Gw2Item(101, "Synthetic Item")], []));
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -224,6 +267,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required tradingpost permission. Create a key with the tradingpost permission.");
+
+        public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2 item metadata request failed with HTTP 503. Try again later.");
     }
 
     private sealed class FixedTimeProvider : TimeProvider

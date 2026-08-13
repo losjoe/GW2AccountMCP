@@ -1222,6 +1222,133 @@ public sealed class Gw2ApiClientTests
         Assert.DoesNotContain("private transaction content", error.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task GetItemsAsync_requests_only_caller_ids_in_order_without_authentication()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item"},{"id":1,"name":"First Item"}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var items = await client.GetItemsAsync([2, 1], CancellationToken.None);
+
+        Assert.Equal([(2L, "Second Item"), (1L, "First Item")], items.Items.Select(item => (item.Id, item.Name)));
+        Assert.Empty(items.MissingItemIds);
+        Assert.Equal(["/v2/items?ids=2%2C1&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.Equal([null], handler.AuthorizationHeaders);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidItemIdBatches))]
+    public async Task GetItemsAsync_rejects_invalid_batches_before_request(long[] itemIds)
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => client.GetItemsAsync(itemIds, CancellationToken.None));
+
+        Assert.Empty(handler.RequestUris);
+    }
+
+    public static TheoryData<long[]> InvalidItemIdBatches => new()
+    {
+        { [] },
+        { [0] },
+        { [-1] },
+        { [1, 1] },
+        { Enumerable.Range(1, 201).Select(value => (long)value).ToArray() }
+    };
+
+    [Fact]
+    public async Task GetItemsAsync_accepts_partial_content_and_reports_missing_ids_in_caller_order()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item"}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var items = await client.GetItemsAsync([3, 2, 1], CancellationToken.None);
+
+        Assert.Equal([(2L, "Second Item")], items.Items.Select(item => (item.Id, item.Name)));
+        Assert.Equal([3L, 1L], items.MissingItemIds);
+    }
+
+    public static TheoryData<string> InvalidItemMetadataResponses => new()
+    {
+        "{malformed",
+        "null",
+        "{}",
+        "[null]",
+        "[{}]",
+        "[{\"id\":0,\"name\":\"Item\"}]",
+        "[{\"id\":1,\"name\":\"\"}]",
+        "[{\"id\":1,\"name\":\"Item\"},{\"id\":1,\"name\":\"Duplicate\"}]",
+        "[{\"id\":2,\"name\":\"Unrequested\"}]",
+        "[{\"id\":\"1\",\"name\":\"Wrong Type\"}]",
+        "[{\"id\":1,\"name\":1}]"
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidItemMetadataResponses))]
+    public async Task GetItemsAsync_rejects_malformed_invalid_duplicate_or_unrequested_rows(string responseContent)
+    {
+        var handler = new RecordingHandler(new ResponseSpec(responseContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetItemsAsync([1], CancellationToken.None));
+
+        Assert.Contains("item metadata", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(responseContent, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetItemsAsync_rejects_incomplete_http_200_or_nonpartial_http_206()
+    {
+        foreach (var response in new[]
+        {
+            new ResponseSpec("""[{"id":1,"name":"First Item"}]"""),
+            new ResponseSpec("""[{"id":1,"name":"First Item"},{"id":2,"name":"Second Item"}]""", HttpStatusCode.PartialContent)
+        })
+        {
+            var handler = new RecordingHandler(response);
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetItemsAsync([1, 2], CancellationToken.None));
+        }
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.InternalServerError)]
+    public async Task GetItemsAsync_maps_not_found_and_http_failure_to_redacted_metadata_error(HttpStatusCode statusCode)
+    {
+        var handler = new RecordingHandler(new ResponseSpec("private metadata payload", statusCode));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetItemsAsync([1], CancellationToken.None));
+
+        Assert.Contains($"HTTP {(int)statusCode}", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private metadata payload", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetItemsAsync_reuses_unauthenticated_retry_path()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec("""[{"id":1,"name":"First Item"}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var items = await client.GetItemsAsync([1], CancellationToken.None);
+
+        Assert.Single(items.Items);
+        Assert.Equal(2, handler.RequestUris.Count);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Null(value));
+    }
+
     private static Dictionary<string, string> PaginationHeaders(
         string pageSize = "200",
         string pageTotal = "1",
