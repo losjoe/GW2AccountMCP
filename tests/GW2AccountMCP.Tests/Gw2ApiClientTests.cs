@@ -780,6 +780,174 @@ public sealed class Gw2ApiClientTests
         Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
     }
 
+    [Fact]
+    public async Task GetTradingPostDeliveryAsync_missing_key_is_actionable_and_makes_no_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetTradingPostDeliveryAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("{\"permissions\":[\"tradingpost\"]}", "account permission")]
+    [InlineData("{\"permissions\":[\"account\"]}", "tradingpost permission")]
+    public async Task GetTradingPostDeliveryAsync_requires_each_permission_before_delivery_request(string tokenResponse, string requiredPermission)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(tokenResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetTradingPostDeliveryAsync(CancellationToken.None));
+
+        Assert.Contains(requiredPermission, error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetTradingPostDeliveryAsync_normalizes_complete_delivery_without_aggregating_items()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            """{"coins":4294967295,"items":[{"id":101,"count":2},{"id":101,"count":4294967296},{"id":202,"count":3}]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var delivery = await client.GetTradingPostDeliveryAsync(CancellationToken.None);
+
+        Assert.Equal(4294967295L, delivery.Coins);
+        Assert.Equal([(101L, 2L), (101L, 4294967296L), (202L, 3L)], delivery.Items.Select(item => (item.Id, item.Count)));
+        Assert.Equal(
+            [
+                "/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/commerce/delivery?lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+            ],
+            handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
+    [Fact]
+    public async Task GetTradingPostDeliveryAsync_accepts_zero_coins_and_empty_items()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            """{"coins":0,"items":[]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var delivery = await client.GetTradingPostDeliveryAsync(CancellationToken.None);
+
+        Assert.Equal(0L, delivery.Coins);
+        Assert.Empty(delivery.Items);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("[]")]
+    [InlineData("{}")]
+    [InlineData("{\"coins\":null,\"items\":[]}")]
+    [InlineData("{\"coins\":-1,\"items\":[]}")]
+    [InlineData("{\"coins\":0}")]
+    [InlineData("{\"coins\":0,\"items\":null}")]
+    [InlineData("{\"coins\":0,\"items\":[null]}")]
+    [InlineData("{\"coins\":0,\"items\":[{}]}")]
+    [InlineData("{\"coins\":0,\"items\":[{\"id\":0,\"count\":1}]}")]
+    [InlineData("{\"coins\":0,\"items\":[{\"id\":-1,\"count\":1}]}")]
+    [InlineData("{\"coins\":0,\"items\":[{\"id\":1,\"count\":0}]}")]
+    [InlineData("{\"coins\":0,\"items\":[{\"id\":1,\"count\":-1}]}")]
+    [InlineData("{\"coins\":0,\"items\":[{\"id\":\"1\",\"count\":1}]}")]
+    [InlineData("{\"coins\":0,\"items\":[{\"id\":1,\"count\":\"1\"}]}")]
+    public async Task GetTradingPostDeliveryAsync_rejects_malformed_or_invalid_delivery_responses(string deliveryResponse)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            deliveryResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetTradingPostDeliveryAsync(CancellationToken.None));
+
+        Assert.Contains("delivery response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(deliveryResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetTradingPostDeliveryAsync_rejects_partial_content_even_when_payload_is_valid()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec("""{"coins":0,"items":[]}""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetTradingPostDeliveryAsync(CancellationToken.None));
+
+        Assert.Contains("delivery request failed with HTTP 206", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetTradingPostDeliveryAsync_reuses_authenticated_single_retry_for_delivery()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec("""{"coins":0,"items":[]}"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var delivery = await client.GetTradingPostDeliveryAsync(CancellationToken.None);
+
+        Assert.Empty(delivery.Items);
+        Assert.Equal(3, handler.RequestUris.Count);
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.StartsWith("/v2/commerce/delivery?", StringComparison.Ordinal)));
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
+    [Fact]
+    public async Task GetTradingPostDeliveryAsync_maps_auth_and_http_failures_without_exposing_response_content()
+    {
+        var apiKey = new string('k', 16);
+        var authHandler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec("private delivery content", HttpStatusCode.Forbidden));
+        using var authHttpClient = new HttpClient(authHandler) { BaseAddress = new Uri("https://example.test") };
+        var authClient = new Gw2ApiClient(authHttpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var authError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => authClient.GetTradingPostDeliveryAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", authError.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(apiKey, authError.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private delivery content", authError.Message, StringComparison.Ordinal);
+        Assert.Equal(2, authHandler.RequestUris.Count);
+
+        var httpHandler = new RecordingHandler(
+            new ResponseSpec("""{"permissions":["account","tradingpost"]}"""),
+            new ResponseSpec("private delivery content", HttpStatusCode.InternalServerError));
+        using var failureHttpClient = new HttpClient(httpHandler) { BaseAddress = new Uri("https://example.test") };
+        var failureClient = new Gw2ApiClient(failureHttpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var httpError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => failureClient.GetTradingPostDeliveryAsync(CancellationToken.None));
+
+        Assert.Contains("delivery request failed with HTTP 500", httpError.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, httpError.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private delivery content", httpError.Message, StringComparison.Ordinal);
+        Assert.Equal(2, httpHandler.RequestUris.Count);
+    }
+
     private sealed record ResponseSpec(string Content, HttpStatusCode StatusCode = HttpStatusCode.OK, TimeSpan? RetryAfter = null);
 
     private sealed class ImmediateTimeProvider : TimeProvider

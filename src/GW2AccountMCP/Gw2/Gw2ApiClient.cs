@@ -10,6 +10,7 @@ public interface IGw2ApiClient
     Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken);
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
+    Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
@@ -220,6 +221,32 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2CharacterBags(stacks);
     }
 
+    public async Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        await ValidatePermissionsAsync(["account", "tradingpost"], cancellationToken);
+
+        using var response = await SendWithSingleRetryAsync("/v2/commerce/delivery", cancellationToken);
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw InvalidKey();
+        }
+
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            throw new Gw2ConfigurationException($"GW2 delivery request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        var delivery = await DeserializeTradingPostDeliveryAsync(response, cancellationToken);
+        return new Gw2TradingPostDelivery(
+            delivery.Coins!.Value,
+            delivery.Items!.Select(item => new Gw2TradingPostDeliveryItem(item!.Id!.Value, item.Count!.Value)).ToArray());
+    }
+
     private async Task ValidatePermissionsAsync(IReadOnlyList<string> requiredPermissions, CancellationToken cancellationToken)
     {
         using var response = await SendWithSingleRetryAsync("/v2/tokeninfo", cancellationToken);
@@ -405,6 +432,27 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private async Task<TradingPostDeliveryResponse> DeserializeTradingPostDeliveryAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var delivery = await JsonSerializer.DeserializeAsync<TradingPostDeliveryResponse>(stream, JsonOptions, cancellationToken);
+            if (delivery?.Coins is null or < 0
+                || delivery.Items is null
+                || delivery.Items.Any(item => item is null || item.Id is not > 0 || item.Count is not > 0))
+            {
+                throw InvalidTradingPostDeliveryResponse();
+            }
+
+            return delivery;
+        }
+        catch (JsonException)
+        {
+            throw InvalidTradingPostDeliveryResponse();
+        }
+    }
+
     private static async Task<bool> IsInvalidKeyResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -485,6 +533,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidSharedInventoryResponse() => new("GW2 returned an invalid shared-inventory response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterListResponse() => new("GW2 returned an invalid character-list response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterInventoryResponse() => new("GW2 returned an invalid character-inventory response. Try again later.");
+    private static Gw2ConfigurationException InvalidTradingPostDeliveryResponse() => new("GW2 returned an invalid delivery response. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
 
     private sealed record TokenInfo(List<string?>? Permissions);
@@ -495,6 +544,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private sealed record MaterialStackResponse(int? Id, int? Category, long? Count);
     private sealed record CharacterInventoryResponse(List<CharacterBagResponse?>? Bags);
     private sealed record CharacterBagResponse(int? Id, int? Size, List<InventoryStackResponse?>? Inventory);
+    private sealed record TradingPostDeliveryResponse(long? Coins, List<TradingPostDeliveryItemResponse?>? Items);
+    private sealed record TradingPostDeliveryItemResponse(long? Id, long? Count);
 }
 
 public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
@@ -509,6 +560,8 @@ public sealed record Gw2AccountStorage(IReadOnlyList<Gw2StorageStack> Stacks);
 public sealed record Gw2StorageStack(int Id, long Count, Gw2StorageSource Source, int? SlotIndex);
 public sealed record Gw2CharacterBags(IReadOnlyList<Gw2CharacterBagStack> Stacks);
 public sealed record Gw2CharacterBagStack(int Id, long Count, string Character, int BagIndex, int SlotIndex);
+public sealed record Gw2TradingPostDelivery(long Coins, IReadOnlyList<Gw2TradingPostDeliveryItem> Items);
+public sealed record Gw2TradingPostDeliveryItem(long Id, long Count);
 public enum Gw2StorageSource
 {
     Bank,
