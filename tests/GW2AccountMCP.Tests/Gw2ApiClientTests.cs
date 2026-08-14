@@ -450,6 +450,24 @@ public sealed class Gw2ApiClientTests
         Assert.Equal(4, handler.RequestUris.Count);
     }
 
+    [Fact]
+    public async Task GetAccountStorageAsync_retains_duplicate_valid_material_rows()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","inventories"]}""",
+            "[]",
+            """[{"id":11,"category":1,"count":0},{"id":11,"category":2,"count":4}]""",
+            "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var storage = await client.GetAccountStorageAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [(11, 0L, Gw2StorageSource.MaterialStorage, (int?)null), (11, 4L, Gw2StorageSource.MaterialStorage, null)],
+            storage.Stacks.Select(stack => (stack.Id, stack.Count, stack.Source, stack.SlotIndex)));
+    }
+
     [Theory]
     [InlineData("{malformed")]
     [InlineData("null")]
@@ -480,7 +498,6 @@ public sealed class Gw2ApiClientTests
     [InlineData("[{\"id\":1,\"count\":0}]")]
     [InlineData("[{\"id\":0,\"category\":1,\"count\":0}]")]
     [InlineData("[{\"id\":1,\"category\":1,\"count\":-1}]")]
-    [InlineData("[{\"id\":1,\"category\":1,\"count\":0},{\"id\":1,\"category\":1,\"count\":2}]")]
     public async Task GetAccountStorageAsync_rejects_invalid_material_responses(string materialResponse)
     {
         var apiKey = new string('k', 16);

@@ -468,8 +468,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
             var materials = await JsonSerializer.DeserializeAsync<List<MaterialStackResponse?>>(stream, JsonOptions, cancellationToken);
             if (materials is null
-                || materials.Any(stack => stack is null || stack.Id is not > 0 || stack.Category is not > 0 || stack.Count is null or < 0)
-                || materials.Select(stack => stack!.Id!.Value).Distinct().Count() != materials.Count)
+                || materials.Any(stack => stack is null || stack.Id is not > 0 || stack.Category is not > 0 || stack.Count is null or < 0))
             {
                 throw InvalidMaterialStorageResponse();
             }

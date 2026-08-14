@@ -152,6 +152,51 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     }
 
     [Fact]
+    public async Task GetAccountHoldings_preserves_required_nullable_fields_in_structured_content()
+    {
+        using var nullableFactory = new NullableHoldingsMcpApplicationFactory();
+        using var nullableClient = nullableFactory.CreateClient();
+        await InitializeAsync(nullableClient);
+
+        using var response = await PostMcpAsync(nullableClient, 8, "tools/call", new
+        {
+            name = "get_account_holdings",
+            arguments = new { itemIds = new[] { 101L }, currencyIds = new[] { 99, 100 } }
+        });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var item = Assert.Single(structured.GetProperty("items").EnumerateArray());
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("name").ValueKind);
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("onHand").ValueKind);
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("inTradingPostDelivery").ValueKind);
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("listedForSale").ValueKind);
+        Assert.Equal(JsonValueKind.Null, item.GetProperty("ownedTotal").ValueKind);
+
+        var currencies = structured.GetProperty("currencies").EnumerateArray().ToArray();
+        var currency = Assert.Single(currencies, candidate => candidate.GetProperty("id").GetInt32() == 99);
+        Assert.Equal(JsonValueKind.Null, currency.GetProperty("name").ValueKind);
+        Assert.Equal(JsonValueKind.Null, currency.GetProperty("onHand").ValueKind);
+        Assert.Equal(JsonValueKind.Null, currency.GetProperty("ownedTotal").ValueKind);
+        var walletLocation = Assert.Single(
+            Assert.Single(currencies, candidate => candidate.GetProperty("id").GetInt32() == 100)
+                .GetProperty("locations")
+                .EnumerateArray());
+        Assert.Equal(JsonValueKind.Null, walletLocation.GetProperty("character").ValueKind);
+
+        var warnings = structured.GetProperty("warnings").EnumerateArray().ToArray();
+        Assert.NotEmpty(warnings);
+        Assert.All(warnings, warning =>
+        {
+            Assert.True(warning.TryGetProperty("itemId", out _));
+            Assert.True(warning.TryGetProperty("currencyId", out _));
+        });
+        Assert.Contains(warnings, warning => warning.GetProperty("itemId").ValueKind == JsonValueKind.Null);
+        Assert.Contains(warnings, warning => warning.GetProperty("currencyId").ValueKind == JsonValueKind.Null);
+    }
+
+    [Fact]
     public async Task Mcp_route_rejects_non_mcp_get_requests()
     {
         using var response = await client.GetAsync("/mcp");
@@ -224,6 +269,18 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         }
     }
 
+    private sealed class NullableHoldingsMcpApplicationFactory : WebApplicationFactory<Program>
+    {
+        protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IGw2ApiClient>();
+                services.AddSingleton<IGw2ApiClient>(new NullableHoldingsGw2ApiClient());
+            });
+        }
+    }
+
     private sealed class FakeGw2ApiClient : IGw2ApiClient
     {
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) =>
@@ -270,6 +327,30 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2 item metadata request failed with HTTP 503. Try again later.");
+    }
+
+    private sealed class NullableHoldingsGw2ApiClient : IGw2ApiClient
+    {
+        public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
+
+        public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2Wallet([new Gw2WalletBalance(100, "Synthetic Currency", 1)], []));
+
+        public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("Synthetic storage failure.");
+
+        public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2CharacterBags([new Gw2CharacterBagStack(101, 2, "Synthetic Hero", 0, 0)]));
+
+        public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("Synthetic delivery failure.");
+
+        public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("Synthetic current-sells failure.");
+
+        public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("Synthetic metadata failure.");
     }
 
     private sealed class FixedTimeProvider : TimeProvider

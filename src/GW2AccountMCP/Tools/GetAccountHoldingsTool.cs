@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Text.Json.Serialization;
 using GW2AccountMCP.Gw2;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
@@ -359,19 +360,27 @@ public sealed record AccountHoldingsResult(
 
 public sealed record ItemHoldingResult(
     long Id,
-    string? Name,
-    long? OnHand,
-    long? InTradingPostDelivery,
-    long? ListedForSale,
-    long? OwnedTotal,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Name,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? OnHand,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? InTradingPostDelivery,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? ListedForSale,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? OwnedTotal,
     IReadOnlyList<HoldingLocationResult> Locations);
 
 public sealed record CurrencyHoldingResult(
     int Id,
-    string? Name,
-    long? OnHand,
-    long? OwnedTotal,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Name,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? OnHand,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? OwnedTotal,
     IReadOnlyList<HoldingLocationResult> Locations);
 
-public sealed record HoldingLocationResult(string Kind, long Count, string? Character);
-public sealed record HoldingsWarningResult(string Code, string Message, long? ItemId, int? CurrencyId);
+public sealed record HoldingLocationResult(
+    string Kind,
+    long Count,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] string? Character);
+
+public sealed record HoldingsWarningResult(
+    string Code,
+    string Message,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? ItemId,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.Never)] int? CurrencyId);
