@@ -10,6 +10,7 @@ public interface IGw2ApiClient
 {
     Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken);
     Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken);
+    Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken);
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
@@ -94,6 +95,58 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2Wallet(
             wallet.Select(balance => new Gw2WalletBalance(balance.Id!.Value, namesById.GetValueOrDefault(balance.Id.Value), balance.Value!.Value)).ToArray(),
             missingCurrencyIds.Select(id => new Gw2WalletWarning("currency_metadata_missing", id)).ToArray());
+    }
+
+    public async Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        await ValidatePermissionsAsync(["account", "characters"], cancellationToken);
+
+        using var charactersResponse = await SendWithSingleRetryAsync("/v2/characters", cancellationToken);
+        if (charactersResponse.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw InvalidKey();
+        }
+
+        if (charactersResponse.StatusCode != HttpStatusCode.OK)
+        {
+            throw new Gw2ConfigurationException($"GW2 character-list request failed with HTTP {(int)charactersResponse.StatusCode}. Try again later.");
+        }
+
+        var characterNames = await DeserializeCharacterNamesAsync(charactersResponse, cancellationToken);
+        var characters = new List<Gw2Character>();
+        foreach (var characterName in characterNames)
+        {
+            var encodedCharacterName = Uri.EscapeDataString(characterName);
+            using var coreResponse = await SendWithSingleRetryAsync($"/v2/characters/{encodedCharacterName}/core", cancellationToken);
+            if (coreResponse.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                throw InvalidKey();
+            }
+
+            if (coreResponse.StatusCode != HttpStatusCode.OK)
+            {
+                throw new Gw2ConfigurationException($"GW2 character-core request failed with HTTP {(int)coreResponse.StatusCode}. Try again later.");
+            }
+
+            var core = await DeserializeCharacterCoreAsync(coreResponse, characterName, cancellationToken);
+            characters.Add(new Gw2Character(
+                core.Name!,
+                core.Race!,
+                core.Gender!,
+                core.Profession!,
+                core.Level!.Value,
+                core.Age!.Value,
+                core.Created!.Value,
+                core.LastModified!.Value,
+                core.Deaths!.Value));
+        }
+
+        return new Gw2Characters(characters.OrderBy(character => character.Name, StringComparer.Ordinal).ToArray());
     }
 
     public async Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken)
@@ -527,6 +580,37 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private async Task<CharacterCoreResponse> DeserializeCharacterCoreAsync(
+        HttpResponseMessage response,
+        string requestedName,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var core = await JsonSerializer.DeserializeAsync<CharacterCoreResponse>(stream, JsonOptions, cancellationToken);
+            if (core is null
+                || core.Name != requestedName
+                || string.IsNullOrWhiteSpace(core.Race)
+                || string.IsNullOrWhiteSpace(core.Gender)
+                || string.IsNullOrWhiteSpace(core.Profession)
+                || core.Level is not > 0
+                || core.Age is null or < 0
+                || core.Created is null || core.Created.Value == default
+                || core.LastModified is null || core.LastModified.Value == default
+                || core.Deaths is null or < 0)
+            {
+                throw InvalidCharacterCoreResponse();
+            }
+
+            return core;
+        }
+        catch (JsonException)
+        {
+            throw InvalidCharacterCoreResponse();
+        }
+    }
+
     private async Task<TradingPostDeliveryResponse> DeserializeTradingPostDeliveryAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         try
@@ -723,6 +807,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidSharedInventoryResponse() => new("GW2 returned an invalid shared-inventory response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterListResponse() => new("GW2 returned an invalid character-list response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterInventoryResponse() => new("GW2 returned an invalid character-inventory response. Try again later.");
+    private static Gw2ConfigurationException InvalidCharacterCoreResponse() => new("GW2 returned an invalid character-core response. Try again later.");
     private static Gw2ConfigurationException InvalidTradingPostDeliveryResponse() => new("GW2 returned an invalid delivery response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsResponse() => new("GW2 returned an invalid current-sells response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
@@ -737,6 +822,16 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private sealed record MaterialStackResponse(int? Id, int? Category, long? Count);
     private sealed record CharacterInventoryResponse(List<CharacterBagResponse?>? Bags);
     private sealed record CharacterBagResponse(int? Id, int? Size, List<InventoryStackResponse?>? Inventory);
+    private sealed record CharacterCoreResponse(
+        string? Name,
+        string? Race,
+        string? Gender,
+        string? Profession,
+        int? Level,
+        long? Age,
+        DateTimeOffset? Created,
+        [property: JsonPropertyName("last_modified")] DateTimeOffset? LastModified,
+        long? Deaths);
     private sealed record TradingPostDeliveryResponse(long? Coins, List<TradingPostDeliveryItemResponse?>? Items);
     private sealed record TradingPostDeliveryItemResponse(long? Id, long? Count);
     private sealed record CurrentSellResponse(
@@ -757,6 +852,17 @@ public sealed record Gw2Account(string Name, int World, DateTimeOffset Created, 
 public sealed record Gw2Wallet(IReadOnlyList<Gw2WalletBalance> Balances, IReadOnlyList<Gw2WalletWarning> Warnings);
 public sealed record Gw2WalletBalance(int Id, string? Name, long Value);
 public sealed record Gw2WalletWarning(string Code, int CurrencyId);
+public sealed record Gw2Characters(IReadOnlyList<Gw2Character> Characters);
+public sealed record Gw2Character(
+    string Name,
+    string Race,
+    string Gender,
+    string Profession,
+    int Level,
+    long AgeSeconds,
+    DateTimeOffset Created,
+    DateTimeOffset LastModified,
+    long Deaths);
 public sealed record Gw2AccountStorage(IReadOnlyList<Gw2StorageStack> Stacks);
 public sealed record Gw2StorageStack(int Id, long Count, Gw2StorageSource Source, int? SlotIndex);
 public sealed record Gw2CharacterBags(IReadOnlyList<Gw2CharacterBagStack> Stacks);

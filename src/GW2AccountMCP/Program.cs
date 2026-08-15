@@ -32,6 +32,7 @@ builder.Services
     .WithTools<FindItemsTool>()
     .WithTools<GetAccountTool>()
     .WithTools<GetAccountHoldingsTool>()
+    .WithTools<GetCharactersTool>()
     .WithTools<GetWalletTool>();
 
 var app = builder.Build();

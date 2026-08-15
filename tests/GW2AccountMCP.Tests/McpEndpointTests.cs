@@ -17,7 +17,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_four_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_five_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -27,7 +27,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_characters", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -81,6 +81,18 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.True(walletOutputSchema.TryGetProperty("balances", out _));
         Assert.True(walletOutputSchema.TryGetProperty("warnings", out _));
         Assert.True(walletOutputSchema.TryGetProperty("asOf", out _));
+        var characters = toolsByName["get_characters"];
+        var charactersInputSchema = characters.GetProperty("inputSchema");
+        Assert.Empty(charactersInputSchema.GetProperty("properties").EnumerateObject());
+        var charactersOutputSchema = characters.GetProperty("outputSchema");
+        Assert.Equal(["characters", "asOf"], charactersOutputSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var charactersOutputProperties = charactersOutputSchema.GetProperty("properties");
+        Assert.Equal(["characters", "asOf"], charactersOutputProperties.EnumerateObject().Select(property => property.Name));
+        var characterProperties = charactersOutputProperties.GetProperty("characters").GetProperty("items").GetProperty("properties");
+        Assert.Equal(["name", "race", "gender", "profession", "level", "ageSeconds", "created", "lastModified", "deaths"], characterProperties.EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["name", "race", "gender", "profession", "level", "ageSeconds", "created", "lastModified", "deaths"], charactersOutputProperties.GetProperty("characters").GetProperty("items").GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        Assert.DoesNotContain(new string('k', 16), characters.GetRawText(), StringComparison.Ordinal);
+        Assert.DoesNotContain("token", characters.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("GW2_API_KEY", document.RootElement.GetRawText(), StringComparison.OrdinalIgnoreCase);
     }
 
@@ -202,6 +214,32 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         Assert.Contains("wallet permission", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(new string('k', 16), payload, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetCharacters_returns_structured_core_summaries_and_as_of_without_private_configuration()
+    {
+        await InitializeAsync();
+
+        using var response = await PostMcpAsync(12, "tools/call", new { name = "get_characters", arguments = new { } });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+        using var document = JsonDocument.Parse(payload);
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var character = Assert.Single(structured.GetProperty("characters").EnumerateArray());
+        Assert.Equal("Synthetic Hero", character.GetProperty("name").GetString());
+        Assert.Equal("Human", character.GetProperty("race").GetString());
+        Assert.Equal("Female", character.GetProperty("gender").GetString());
+        Assert.Equal("Guardian", character.GetProperty("profession").GetString());
+        Assert.Equal(80, character.GetProperty("level").GetInt32());
+        Assert.Equal(12, character.GetProperty("ageSeconds").GetInt64());
+        Assert.Equal("2020-01-02T03:04:05+00:00", character.GetProperty("created").GetString());
+        Assert.Equal("2026-01-02T03:04:05+00:00", character.GetProperty("lastModified").GetString());
+        Assert.Equal(4, character.GetProperty("deaths").GetInt64());
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
+        Assert.DoesNotContain("key", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", payload, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -384,6 +422,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Wallet([new Gw2WalletBalance(1, "Coin", 42)], []));
 
+        public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2Characters([new Gw2Character("Synthetic Hero", "Human", "Female", "Guardian", 80, 12, DateTimeOffset.Parse("2020-01-02T03:04:05Z"), DateTimeOffset.Parse("2026-01-02T03:04:05Z"), 4)]));
+
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2AccountStorage([new Gw2StorageStack(101, 2, Gw2StorageSource.Bank, 0)]));
 
@@ -409,6 +450,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required wallet permission. Create a key with the wallet permission.");
 
+        public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required characters permission. Create a key with the characters permission.");
+
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required inventories permission. Create a key with the inventories permission.");
 
@@ -433,6 +477,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Wallet([new Gw2WalletBalance(100, "Synthetic Currency", 1)], []));
+
+        public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) =>
+            throw new NotSupportedException();
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("Synthetic storage failure.");

@@ -797,6 +797,189 @@ public sealed class Gw2ApiClientTests
         Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
     }
 
+    [Theory]
+    [InlineData("{\"permissions\":[\"characters\"]}", "account permission")]
+    [InlineData("{\"permissions\":[\"account\"]}", "characters permission")]
+    public async Task GetCharactersAsync_requires_only_each_core_permission_before_character_requests(string tokenResponse, string requiredPermission)
+    {
+        var handler = new RecordingHandler(tokenResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Contains(requiredPermission, error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharactersAsync_requires_a_configured_key_before_any_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharactersAsync_traverses_encoded_names_sequentially_maps_all_fields_and_sorts_ordinally()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters"]}""",
+            """["Zulu Hero","Path/Query?# Hero","Alpha Hero"]""",
+            CoreCharacter("Zulu Hero", "Human", "Male", "Guardian", 80, 12, "2020-01-02T03:04:05Z", "2026-01-02T03:04:05Z", 4, "\"future\":true"),
+            CoreCharacter("Path/Query?# Hero", "Asura", "Female", "Engineer", 31, 0, "2021-02-03T04:05:06Z", "2026-02-03T04:05:06Z", 0),
+            CoreCharacter("Alpha Hero", "Norn", "Female", "Ranger", 2, 99, "2022-03-04T05:06:07Z", "2026-03-04T05:06:07Z", 8));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"));
+
+        var characters = await client.GetCharactersAsync(CancellationToken.None);
+
+        Assert.Equal(
+        [
+            ("Alpha Hero", "Norn", "Female", "Ranger", 2, 99L, DateTimeOffset.Parse("2022-03-04T05:06:07Z"), DateTimeOffset.Parse("2026-03-04T05:06:07Z"), 8L),
+            ("Path/Query?# Hero", "Asura", "Female", "Engineer", 31, 0L, DateTimeOffset.Parse("2021-02-03T04:05:06Z"), DateTimeOffset.Parse("2026-02-03T04:05:06Z"), 0L),
+            ("Zulu Hero", "Human", "Male", "Guardian", 80, 12L, DateTimeOffset.Parse("2020-01-02T03:04:05Z"), DateTimeOffset.Parse("2026-01-02T03:04:05Z"), 4L)
+        ], characters.Characters.Select(character => (character.Name, character.Race, character.Gender, character.Profession, character.Level, character.AgeSeconds, character.Created, character.LastModified, character.Deaths)));
+        Assert.Equal(
+        [
+            "/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+            "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+            "/v2/characters/Zulu%20Hero/core?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+            "/v2/characters/Path%2FQuery%3F%23%20Hero/core?lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+            "/v2/characters/Alpha%20Hero/core?lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+        ], handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal($"Bearer {apiKey}", value));
+    }
+
+    [Fact]
+    public async Task GetCharactersAsync_accepts_an_empty_roster()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters"]}""", "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var characters = await client.GetCharactersAsync(CancellationToken.None);
+
+        Assert.Empty(characters.Characters);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("null")]
+    [InlineData("[\"\"]")]
+    [InlineData("[\"Duplicate Hero\",\"Duplicate Hero\"]")]
+    public async Task GetCharactersAsync_rejects_malformed_missing_or_duplicate_character_lists(string characterResponse)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters"]}""", characterResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Contains("character-list response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("{malformed")]
+    [InlineData("{}")]
+    [InlineData("{\"name\":\"Synthetic Hero\",\"race\":\"Human\",\"gender\":\"Male\",\"profession\":\"Guardian\",\"level\":0,\"age\":0,\"created\":\"2020-01-02T03:04:05Z\",\"last_modified\":\"2026-01-02T03:04:05Z\",\"deaths\":0}")]
+    [InlineData("{\"name\":\"Synthetic Hero\",\"race\":\"Human\",\"gender\":\"Male\",\"profession\":\"Guardian\",\"level\":1,\"age\":-1,\"created\":\"2020-01-02T03:04:05Z\",\"last_modified\":\"2026-01-02T03:04:05Z\",\"deaths\":0}")]
+    [InlineData("{\"name\":\"Synthetic Hero\",\"race\":\"Human\",\"gender\":\"Male\",\"profession\":\"Guardian\",\"level\":1,\"age\":0,\"created\":\"0001-01-01T00:00:00Z\",\"last_modified\":\"2026-01-02T03:04:05Z\",\"deaths\":0}")]
+    public async Task GetCharactersAsync_rejects_malformed_missing_or_invalid_core_rows(string coreResponse)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters"]}""", """["Synthetic Hero"]""", coreResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Contains("character-core response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCharactersAsync_rejects_a_core_name_mismatch()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters"]}""", """["Requested Hero"]""", CoreCharacter("Returned Hero"));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task GetCharactersAsync_rejects_list_or_core_authentication_failures_without_continuing(bool coreFailure)
+    {
+        var responses = coreFailure
+            ? new object[] { """{"permissions":["account","characters"]}""", """["First Hero","Unrequested Hero"]""", new ResponseSpec("Permission denied", HttpStatusCode.Forbidden) }
+            : ["""{"permissions":["account","characters"]}""", new ResponseSpec("Permission denied", HttpStatusCode.Unauthorized)];
+        var handler = new RecordingHandler(responses);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Equal(coreFailure ? 3 : 2, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("Unrequested", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(206, false)]
+    [InlineData(206, true)]
+    [InlineData(500, false)]
+    [InlineData(500, true)]
+    public async Task GetCharactersAsync_rejects_non_ok_responses_as_total_and_stops_traversal(int statusCode, bool coreFailure)
+    {
+        var responses = coreFailure
+            ? new object[] { """{"permissions":["account","characters"]}""", """["First Hero","Unrequested Hero"]""", new ResponseSpec("private response", (HttpStatusCode)statusCode) }
+            : ["""{"permissions":["account","characters"]}""", new ResponseSpec("[]", (HttpStatusCode)statusCode)];
+        var handler = new RecordingHandler(responses);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharactersAsync(CancellationToken.None));
+
+        Assert.Equal(coreFailure ? 3 : 2, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("Unrequested", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharactersAsync_propagates_caller_cancellation_and_stops_traversal()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        var requests = 0;
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters"]}""",
+            """["First Hero","Unrequested Hero"]""",
+            CoreCharacter("First Hero"))
+        {
+            OnRequest = () =>
+            {
+                if (++requests == 3) cancellationSource.Cancel();
+            }
+        };
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.GetCharactersAsync(cancellationSource.Token));
+
+        Assert.Equal(3, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("Unrequested", StringComparison.Ordinal));
+    }
+
     [Fact]
     public async Task GetTradingPostDeliveryAsync_missing_key_is_actionable_and_makes_no_request()
     {
@@ -1381,6 +1564,19 @@ public sealed class Gw2ApiClientTests
     private static string CurrentSellPage(int firstOffset, int count) =>
         "[" + string.Join(',', Enumerable.Range(firstOffset, count).Select(offset =>
             $$"""{"id":{{7000L + offset}},"item_id":{{300L + offset}},"price":{{10L + offset}},"quantity":{{20L + offset}},"created":"2026-01-02T03:04:05Z"}""")) + "]";
+
+    private static string CoreCharacter(
+        string name,
+        string race = "Human",
+        string gender = "Male",
+        string profession = "Guardian",
+        int level = 80,
+        long age = 1,
+        string created = "2020-01-02T03:04:05Z",
+        string lastModified = "2026-01-02T03:04:05Z",
+        long deaths = 0,
+        string? additionalField = null) =>
+        $$"""{"name":"{{name}}","race":"{{race}}","gender":"{{gender}}","profession":"{{profession}}","level":{{level}},"age":{{age}},"created":"{{created}}","last_modified":"{{lastModified}}","deaths":{{deaths}}{{(additionalField is null ? string.Empty : "," + additionalField)}}}""";
 
     private sealed record ResponseSpec(
         string Content,

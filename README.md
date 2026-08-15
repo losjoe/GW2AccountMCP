@@ -4,10 +4,11 @@ Local, read-only Guild Wars 2 account facts over stateless Streamable HTTP MCP.
 
 ## Current scope
 
-The server exposes four tools:
+The server exposes five tools:
 
 - `find_items` resolves a bounded English item-name fragment from the generated local public cache. It returns exact matches before contains matches with canonical ID, name, type, rarity, level, and match kind. It does not call the GW2 API at request time or choose among ambiguous names.
 - `get_account` validates the configured key through `/v2/tokeninfo`, requires `account`, and returns basic account facts with an `asOf` timestamp.
+- `get_characters` requires `account` and `characters`, retrieves the complete character list and each character's core record, and returns name-ordered summaries with name, race, gender, profession, level, playtime seconds, creation and last-modified timestamps, and deaths. The result is complete or the whole operation fails; it does not include inventory, equipment, builds, guild, or title data.
 - `get_wallet` requires `account` and `wallet`, retrieves `/v2/account/wallet`, and joins each canonical currency ID to its English `/v2/currencies` name. It returns `long` values, one `asOf` timestamp, and warnings that retain the ID and value when metadata is unavailable. An empty wallet is returned as an empty balance list.
 - `get_account_holdings` accepts separate optional `itemIds` and `currencyIds` arrays, requires at least one ID, and permits at most 20 combined positive IDs with no duplicates within either array. It preserves caller order and treats item and currency IDs as separate canonical namespaces, so the same numeric ID may appear once in each array.
 
@@ -147,6 +148,7 @@ Then invoke a tool through Inspector. Account-backed tools need a locally config
 ```powershell
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name find_items --tool-args-json '{"query":"Mystic Coin"}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_characters --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_wallet --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account_holdings --tool-args-json '{"itemIds":[101,202],"currencyIds":[3]}' --format json
 ```
@@ -161,4 +163,4 @@ Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create
 tunnel-client init --sample sample_mcp_remote_no_auth --profile gw2-account --tunnel-id <tunnel-id> --mcp-server-url http://127.0.0.1:5288/mcp
 ```
 
-Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `find_items`, `get_account`, `get_account_holdings`, and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.
+Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `find_items`, `get_account`, `get_account_holdings`, `get_characters`, and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.
