@@ -443,6 +443,7 @@ public sealed class GetAccountHoldingsTests
 
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) => Complete("wallet", Wallet, WalletError);
         public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) => Complete("storage", AccountStorage, StorageError);
         public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) => Complete("bags", CharacterBags, CharacterError);
         public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) => Complete("delivery", Delivery, DeliveryError);

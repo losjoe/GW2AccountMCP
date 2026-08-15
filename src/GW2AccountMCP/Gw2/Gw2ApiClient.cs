@@ -11,6 +11,7 @@ public interface IGw2ApiClient
     Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken);
     Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken);
     Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken);
+    Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
@@ -147,6 +148,80 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
 
         return new Gw2Characters(characters.OrderBy(character => character.Name, StringComparer.Ordinal).ToArray());
+    }
+
+    public async Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        await ValidatePermissionsAsync(["account", "characters", "builds"], cancellationToken);
+        using var charactersResponse = await SendWithSingleRetryAsync("/v2/characters", cancellationToken);
+        if (charactersResponse.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw InvalidKey();
+        }
+
+        if (charactersResponse.StatusCode != HttpStatusCode.OK)
+        {
+            throw new Gw2ConfigurationException($"GW2 character-list request failed with HTTP {(int)charactersResponse.StatusCode}. Try again later.");
+        }
+
+        var canonicalCharacterName = (await DeserializeCharacterNamesAsync(charactersResponse, cancellationToken))
+            .SingleOrDefault(name => string.Equals(name, characterName, StringComparison.Ordinal));
+        if (canonicalCharacterName is null)
+        {
+            throw new Gw2ConfigurationException("The requested character was not found in the authenticated roster.");
+        }
+
+        using var activeResponse = await SendWithSingleRetryAsync(
+            $"/v2/characters/{Uri.EscapeDataString(canonicalCharacterName)}/buildtabs/active",
+            cancellationToken);
+        if (activeResponse.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+        {
+            throw InvalidKey();
+        }
+
+        if (activeResponse.StatusCode != HttpStatusCode.OK)
+        {
+            throw new Gw2ConfigurationException($"GW2 character-build request failed with HTTP {(int)activeResponse.StatusCode}. Try again later.");
+        }
+
+        var build = await DeserializeActiveCharacterBuildAsync(activeResponse, cancellationToken);
+        var specializationIds = build.Specializations.Where(slot => slot.Id is not null).Select(slot => slot.Id!.Value).Distinct().Order().ToArray();
+        var traitIds = build.Specializations.SelectMany(slot => slot.Traits).Where(id => id is not null).Select(id => id!.Value).Distinct().Order().ToArray();
+        var petIds = build.Pets is null ? [] : build.Pets.Terrestrial.Concat(build.Pets.Aquatic).Where(id => id is not null).Select(id => id!.Value).Distinct().Order().ToArray();
+        var legendIds = build.Legends is null ? [] : build.Legends.Terrestrial.Concat(build.Legends.Aquatic).Where(id => id is not null).Select(id => id!).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).ToArray();
+        var selectedSkillIds = build.TerrestrialSkills.AllIds().Concat(build.AquaticSkills.AllIds()).Distinct().Order().ToArray();
+
+        var specializations = await ResolveNumericMetadataAsync("specializations", specializationIds, cancellationToken);
+        var traits = await ResolveNumericMetadataAsync("traits", traitIds, cancellationToken);
+        var pets = await ResolveNumericMetadataAsync("pets", petIds, cancellationToken);
+        var legends = await ResolveLegendMetadataAsync(legendIds, cancellationToken);
+        var swapSkillIds = legends.Rows.Values.Select(legend => legend.Swap).Distinct().Order().ToArray();
+        var skills = await ResolveNumericMetadataAsync("skills", selectedSkillIds.Concat(swapSkillIds).Distinct().Order().ToArray(), cancellationToken);
+
+        var warnings = BuildMetadataWarnings(specializationIds, specializations, traitIds, traits, petIds, pets, legendIds, legends, selectedSkillIds.Concat(swapSkillIds).Distinct(), skills);
+        return new Gw2CharacterBuild(
+            canonicalCharacterName,
+            build.Tab,
+            build.Name,
+            build.Profession,
+            build.Specializations.Select(slot => new Gw2BuildSpecialization(
+                ToReference(slot.Id, specializations.Rows),
+                slot.Traits.Select(id => ToReference(id, traits.Rows)).ToArray())).ToArray(),
+            new Gw2BuildSkills(ToReference(build.TerrestrialSkills.Heal, skills.Rows), build.TerrestrialSkills.Utilities.Select(id => ToReference(id, skills.Rows)).ToArray(), ToReference(build.TerrestrialSkills.Elite, skills.Rows)),
+            new Gw2BuildSkills(ToReference(build.AquaticSkills.Heal, skills.Rows), build.AquaticSkills.Utilities.Select(id => ToReference(id, skills.Rows)).ToArray(), ToReference(build.AquaticSkills.Elite, skills.Rows)),
+            build.Pets is { } petsSlots
+                ? new Gw2BuildPets(petsSlots.Terrestrial.Select(id => ToReference(id, pets.Rows)).ToArray(), petsSlots.Aquatic.Select(id => ToReference(id, pets.Rows)).ToArray())
+                : null,
+            build.Legends is { } legendSlots
+                ? new Gw2BuildLegends(legendSlots.Terrestrial.Select(id => ToLegendReference(id, legends.Rows, skills.Rows)).ToArray(), legendSlots.Aquatic.Select(id => ToLegendReference(id, legends.Rows, skills.Rows)).ToArray())
+                : null,
+            warnings.Count == 0,
+            warnings);
     }
 
     public async Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken)
@@ -436,6 +511,254 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         {
             throw InvalidAccountResponse();
         }
+    }
+
+    private async Task<ActiveBuildPayload> DeserializeActiveCharacterBuildAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            var outer = RequiredObject(document.RootElement);
+            var tab = RequiredInt(outer, "tab");
+            if (tab <= 0 || !RequiredBoolean(outer, "is_active")) throw InvalidCharacterBuildResponse();
+            var build = RequiredObject(RequiredProperty(outer, "build"));
+            var name = RequiredString(build, "name", allowEmpty: true);
+            var profession = RequiredString(build, "profession", allowEmpty: false);
+            var specializations = RequiredArray(build, "specializations");
+            if (specializations.GetArrayLength() != 3) throw InvalidCharacterBuildResponse();
+            var specializationSlots = specializations.EnumerateArray().Select(ParseSpecialization).ToArray();
+            if (specializationSlots.Any(slot => slot.Id is null && slot.Traits.Any(id => id is not null))) throw InvalidCharacterBuildResponse();
+            var terrestrialSkills = ParseSkills(RequiredObject(RequiredProperty(build, "skills")));
+            var aquaticSkills = ParseSkills(RequiredObject(RequiredProperty(build, "aquatic_skills")));
+
+            PetSlots? pets = null;
+            LegendSlots? legends = null;
+            if (profession == "Ranger")
+            {
+                if (HasProperty(build, "legends") || HasProperty(build, "aquatic_legends")) throw InvalidCharacterBuildResponse();
+                var petObject = RequiredObject(RequiredProperty(build, "pets"));
+                pets = new PetSlots(ParseNullablePositiveIntegers(RequiredArray(petObject, "terrestrial"), 2), ParseNullablePositiveIntegers(RequiredArray(petObject, "aquatic"), 2));
+            }
+            else if (profession == "Revenant")
+            {
+                if (HasProperty(build, "pets")) throw InvalidCharacterBuildResponse();
+                legends = new LegendSlots(ParseNullableNonblankStrings(RequiredArray(build, "legends"), 2), ParseNullableNonblankStrings(RequiredArray(build, "aquatic_legends"), 2));
+            }
+            else if (HasProperty(build, "pets") || HasProperty(build, "legends") || HasProperty(build, "aquatic_legends"))
+            {
+                throw InvalidCharacterBuildResponse();
+            }
+
+            return new ActiveBuildPayload(tab, name, profession, specializationSlots, terrestrialSkills, aquaticSkills, pets, legends);
+        }
+        catch (JsonException)
+        {
+            throw InvalidCharacterBuildResponse();
+        }
+    }
+
+    private async Task<NumericMetadataBatch> ResolveNumericMetadataAsync(string resolver, IReadOnlyList<int> requestedIds, CancellationToken cancellationToken)
+    {
+        if (requestedIds.Count == 0) return new(new Dictionary<int, string>());
+        try
+        {
+            using var response = await SendWithSingleRetryAsync($"/v2/{resolver}?ids={Uri.EscapeDataString(string.Join(',', requestedIds))}", cancellationToken, authenticated: false);
+            if (response.StatusCode == HttpStatusCode.NotFound) return new(new Dictionary<int, string>());
+            if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) return new(new Dictionary<int, string>());
+            var rows = await DeserializeNumericMetadataAsync(response, requestedIds.ToHashSet(), cancellationToken);
+            var ids = rows.Keys.ToHashSet();
+            if ((response.StatusCode == HttpStatusCode.OK && !ids.SetEquals(requestedIds))
+                || (response.StatusCode == HttpStatusCode.PartialContent && (ids.Count == 0 || ids.Count == requestedIds.Count)))
+            {
+                return new(new Dictionary<int, string>());
+            }
+
+            return new(rows);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return new(new Dictionary<int, string>());
+        }
+    }
+
+    private async Task<LegendMetadataBatch> ResolveLegendMetadataAsync(IReadOnlyList<string> requestedIds, CancellationToken cancellationToken)
+    {
+        if (requestedIds.Count == 0) return new(new Dictionary<string, LegendMetadata>(StringComparer.Ordinal));
+        try
+        {
+            using var response = await SendWithSingleRetryAsync($"/v2/legends?ids={Uri.EscapeDataString(string.Join(',', requestedIds))}", cancellationToken, authenticated: false);
+            if (response.StatusCode == HttpStatusCode.NotFound) return new(new Dictionary<string, LegendMetadata>(StringComparer.Ordinal));
+            if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) return new(new Dictionary<string, LegendMetadata>(StringComparer.Ordinal));
+            var rows = await DeserializeLegendMetadataAsync(response, requestedIds.ToHashSet(StringComparer.Ordinal), cancellationToken);
+            var ids = rows.Keys.ToHashSet(StringComparer.Ordinal);
+            if ((response.StatusCode == HttpStatusCode.OK && !ids.SetEquals(requestedIds))
+                || (response.StatusCode == HttpStatusCode.PartialContent && (ids.Count == 0 || ids.Count == requestedIds.Count)))
+            {
+                return new(new Dictionary<string, LegendMetadata>(StringComparer.Ordinal));
+            }
+
+            return new(rows);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return new(new Dictionary<string, LegendMetadata>(StringComparer.Ordinal));
+        }
+    }
+
+    private async Task<Dictionary<int, string>> DeserializeNumericMetadataAsync(HttpResponseMessage response, IReadOnlySet<int> requestedIds, CancellationToken cancellationToken)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        if (document.RootElement.ValueKind != JsonValueKind.Array) throw InvalidCharacterBuildResponse();
+        var rows = new Dictionary<int, string>();
+        foreach (var row in document.RootElement.EnumerateArray())
+        {
+            var objectRow = RequiredObject(row);
+            var id = RequiredInt(objectRow, "id");
+            var name = RequiredString(objectRow, "name", allowEmpty: false);
+            if (id <= 0 || !requestedIds.Contains(id) || !rows.TryAdd(id, name)) throw InvalidCharacterBuildResponse();
+        }
+
+        return rows;
+    }
+
+    private async Task<Dictionary<string, LegendMetadata>> DeserializeLegendMetadataAsync(HttpResponseMessage response, IReadOnlySet<string> requestedIds, CancellationToken cancellationToken)
+    {
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+        if (document.RootElement.ValueKind != JsonValueKind.Array) throw InvalidCharacterBuildResponse();
+        var rows = new Dictionary<string, LegendMetadata>(StringComparer.Ordinal);
+        foreach (var row in document.RootElement.EnumerateArray())
+        {
+            var objectRow = RequiredObject(row);
+            var id = RequiredString(objectRow, "id", allowEmpty: false);
+            var code = RequiredInt(objectRow, "code");
+            var swap = RequiredInt(objectRow, "swap");
+            if (swap <= 0 || !requestedIds.Contains(id) || !rows.TryAdd(id, new LegendMetadata(code, swap))) throw InvalidCharacterBuildResponse();
+        }
+
+        return rows;
+    }
+
+    private static IReadOnlyList<Gw2MetadataWarning> BuildMetadataWarnings(
+        IEnumerable<int> specializationIds, NumericMetadataBatch specializations,
+        IEnumerable<int> traitIds, NumericMetadataBatch traits,
+        IEnumerable<int> petIds, NumericMetadataBatch pets,
+        IEnumerable<string> legendIds, LegendMetadataBatch legends,
+        IEnumerable<int> skillIds, NumericMetadataBatch skills)
+    {
+        var warnings = new List<Gw2MetadataWarning>();
+        AddWarnings(warnings, "specializations", specializationIds.Select(id => id.ToString(CultureInfo.InvariantCulture)), specializations.Rows.Keys.Select(id => id.ToString(CultureInfo.InvariantCulture)));
+        AddWarnings(warnings, "traits", traitIds.Select(id => id.ToString(CultureInfo.InvariantCulture)), traits.Rows.Keys.Select(id => id.ToString(CultureInfo.InvariantCulture)));
+        AddWarnings(warnings, "pets", petIds.Select(id => id.ToString(CultureInfo.InvariantCulture)), pets.Rows.Keys.Select(id => id.ToString(CultureInfo.InvariantCulture)));
+        AddWarnings(warnings, "legends", legendIds, legends.Rows.Keys);
+        AddWarnings(warnings, "skills", skillIds.Select(id => id.ToString(CultureInfo.InvariantCulture)), skills.Rows.Keys.Select(id => id.ToString(CultureInfo.InvariantCulture)));
+        return warnings;
+    }
+
+    private static void AddWarnings(List<Gw2MetadataWarning> warnings, string resolver, IEnumerable<string> requested, IEnumerable<string> resolved)
+    {
+        var resolvedSet = resolved.ToHashSet(StringComparer.Ordinal);
+        foreach (var id in requested.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).Where(id => !resolvedSet.Contains(id)))
+        {
+            warnings.Add(new Gw2MetadataWarning("metadata_unresolved", resolver, id));
+        }
+    }
+
+    private static Gw2NumericReference? ToReference(int? id, IReadOnlyDictionary<int, string> names) => id is { } value ? new Gw2NumericReference(value, names.GetValueOrDefault(value)) : null;
+
+    private static Gw2LegendReference? ToLegendReference(string? id, IReadOnlyDictionary<string, LegendMetadata> legends, IReadOnlyDictionary<int, string> skills)
+    {
+        if (id is null) return null;
+        return legends.TryGetValue(id, out var legend)
+            ? new Gw2LegendReference(id, legend.Code, new Gw2NumericReference(legend.Swap, skills.GetValueOrDefault(legend.Swap)))
+            : new Gw2LegendReference(id, null, null);
+    }
+
+    private static SpecializationSlot ParseSpecialization(JsonElement element)
+    {
+        var specialization = RequiredObject(element);
+        var id = NullablePositiveInt(specialization, "id");
+        return new SpecializationSlot(id, ParseNullablePositiveIntegers(RequiredArray(specialization, "traits"), 3));
+    }
+
+    private static SkillSlots ParseSkills(JsonElement skills)
+    {
+        return new SkillSlots(NullablePositiveInt(skills, "heal"), ParseNullablePositiveIntegers(RequiredArray(skills, "utilities"), 3), NullablePositiveInt(skills, "elite"));
+    }
+
+    private static int?[] ParseNullablePositiveIntegers(JsonElement array, int count)
+    {
+        if (array.GetArrayLength() != count) throw InvalidCharacterBuildResponse();
+        return array.EnumerateArray().Select(value =>
+        {
+            if (value.ValueKind == JsonValueKind.Null) return (int?)null;
+            if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var id) || id <= 0) throw InvalidCharacterBuildResponse();
+            return id;
+        }).ToArray();
+    }
+
+    private static string?[] ParseNullableNonblankStrings(JsonElement array, int count)
+    {
+        if (array.GetArrayLength() != count) throw InvalidCharacterBuildResponse();
+        return array.EnumerateArray().Select(value =>
+        {
+            if (value.ValueKind == JsonValueKind.Null) return null;
+            if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString())) throw InvalidCharacterBuildResponse();
+            return value.GetString();
+        }).ToArray();
+    }
+
+    private static JsonElement RequiredProperty(JsonElement element, string name)
+    {
+        var properties = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (properties.Length != 1) throw InvalidCharacterBuildResponse();
+        return properties[0].Value;
+    }
+
+    private static bool HasProperty(JsonElement element, string name) => element.EnumerateObject().Any(property => property.NameEquals(name));
+    private static JsonElement RequiredObject(JsonElement element) => element.ValueKind == JsonValueKind.Object ? element : throw InvalidCharacterBuildResponse();
+    private static JsonElement RequiredArray(JsonElement element, string name)
+    {
+        var value = RequiredProperty(element, name);
+        return value.ValueKind == JsonValueKind.Array ? value : throw InvalidCharacterBuildResponse();
+    }
+
+    private static string RequiredString(JsonElement element, string name, bool allowEmpty)
+    {
+        var value = RequiredProperty(element, name);
+        if (value.ValueKind != JsonValueKind.String || (!allowEmpty && string.IsNullOrWhiteSpace(value.GetString()))) throw InvalidCharacterBuildResponse();
+        return value.GetString()!;
+    }
+
+    private static int RequiredInt(JsonElement element, string name)
+    {
+        var value = RequiredProperty(element, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var number)) throw InvalidCharacterBuildResponse();
+        return number;
+    }
+
+    private static bool RequiredBoolean(JsonElement element, string name)
+    {
+        var value = RequiredProperty(element, name);
+        return value.ValueKind is JsonValueKind.True ? true : value.ValueKind is JsonValueKind.False ? false : throw InvalidCharacterBuildResponse();
+    }
+
+    private static int? NullablePositiveInt(JsonElement element, string name)
+    {
+        var value = RequiredProperty(element, name);
+        if (value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var number) || number <= 0) throw InvalidCharacterBuildResponse();
+        return number;
     }
 
     private async Task<TokenInfo> DeserializeTokenInfoAsync(HttpResponseMessage response, CancellationToken cancellationToken)
@@ -813,7 +1136,19 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
     private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
+    private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
 
+    private sealed record ActiveBuildPayload(int Tab, string Name, string Profession, IReadOnlyList<SpecializationSlot> Specializations, SkillSlots TerrestrialSkills, SkillSlots AquaticSkills, PetSlots? Pets, LegendSlots? Legends);
+    private sealed record SpecializationSlot(int? Id, IReadOnlyList<int?> Traits);
+    private sealed record SkillSlots(int? Heal, IReadOnlyList<int?> Utilities, int? Elite)
+    {
+        public IEnumerable<int> AllIds() => new[] { Heal }.Concat(Utilities).Append(Elite).Where(id => id is not null).Select(id => id!.Value);
+    }
+    private sealed record PetSlots(IReadOnlyList<int?> Terrestrial, IReadOnlyList<int?> Aquatic);
+    private sealed record LegendSlots(IReadOnlyList<string?> Terrestrial, IReadOnlyList<string?> Aquatic);
+    private sealed record NumericMetadataBatch(IReadOnlyDictionary<int, string> Rows);
+    private sealed record LegendMetadataBatch(IReadOnlyDictionary<string, LegendMetadata> Rows);
+    private sealed record LegendMetadata(int Code, int Swap);
     private sealed record TokenInfo(List<string?>? Permissions);
     private sealed record AccountResponse(string? Name, int? World, DateTimeOffset? Created, List<string>? Access);
     private sealed record WalletBalanceResponse(int? Id, long? Value);
@@ -873,6 +1208,25 @@ public sealed record Gw2CurrentSells(IReadOnlyList<Gw2CurrentSellOrder> Orders);
 public sealed record Gw2CurrentSellOrder(long Id, long ItemId, long Price, long Quantity, DateTimeOffset Created);
 public sealed record Gw2Items(IReadOnlyList<Gw2Item> Items, IReadOnlyList<long> MissingItemIds);
 public sealed record Gw2Item(long Id, string Name);
+public sealed record Gw2CharacterBuild(
+    string CharacterName,
+    int Tab,
+    string BuildName,
+    string Profession,
+    IReadOnlyList<Gw2BuildSpecialization> Specializations,
+    Gw2BuildSkills TerrestrialSkills,
+    Gw2BuildSkills AquaticSkills,
+    Gw2BuildPets? Pets,
+    Gw2BuildLegends? Legends,
+    bool IsMetadataComplete,
+    IReadOnlyList<Gw2MetadataWarning> Warnings);
+public sealed record Gw2BuildSpecialization(Gw2NumericReference? Specialization, IReadOnlyList<Gw2NumericReference?> SelectedTraits);
+public sealed record Gw2BuildSkills(Gw2NumericReference? Heal, IReadOnlyList<Gw2NumericReference?> Utilities, Gw2NumericReference? Elite);
+public sealed record Gw2BuildPets(IReadOnlyList<Gw2NumericReference?> Terrestrial, IReadOnlyList<Gw2NumericReference?> Aquatic);
+public sealed record Gw2BuildLegends(IReadOnlyList<Gw2LegendReference?> Terrestrial, IReadOnlyList<Gw2LegendReference?> Aquatic);
+public sealed record Gw2NumericReference(int Id, string? Name);
+public sealed record Gw2LegendReference(string Id, int? Code, Gw2NumericReference? SwapSkill);
+public sealed record Gw2MetadataWarning(string Code, string Resolver, string ReferenceId);
 public enum Gw2StorageSource
 {
     Bank,

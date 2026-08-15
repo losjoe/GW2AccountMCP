@@ -1549,6 +1549,222 @@ public sealed class Gw2ApiClientTests
         Assert.All(handler.AuthorizationHeaders, value => Assert.Null(value));
     }
 
+    [Fact]
+    public async Task GetCharacterBuildAsync_selects_exact_canonical_roster_name_requests_only_active_tab_and_enriches_valid_legends_before_skills()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds"]}""", """["Other Hero","Path/Query?# Hero"]""",
+            """{"tab":2,"is_active":true,"build":{"name":"","profession":"Revenant","specializations":[{"id":10,"traits":[11,null,null]},{"id":null,"traits":[null,null,null]},{"id":null,"traits":[null,null,null]}],"skills":{"heal":20,"utilities":[21,null,null],"elite":null},"aquatic_skills":{"heal":null,"utilities":[null,null,null],"elite":null},"legends":["LegendB",null],"aquatic_legends":[null,null]}}""",
+            """[{"id":10,"name":"Invocation"}]""", """[{"id":11,"name":"Trait"}]""", """[{"id":"LegendB","code":7,"swap":30}]""", """[{"id":20,"name":"Heal"},{"id":21,"name":"Utility"},{"id":30,"name":"Swap"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var build = await client.GetCharacterBuildAsync("Path/Query?# Hero", CancellationToken.None);
+
+        Assert.Equal("Path/Query?# Hero", build.CharacterName);
+        Assert.Equal("Invocation", build.Specializations[0].Specialization!.Name);
+        Assert.Equal("Utility", build.TerrestrialSkills.Utilities[0]!.Name);
+        Assert.Equal(7, build.Legends!.Terrestrial[0]!.Code);
+        Assert.Equal("Swap", build.Legends.Terrestrial[0]!.SwapSkill!.Name);
+        Assert.True(build.IsMetadataComplete);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Path%2FQuery%3F%23%20Hero/buildtabs/active?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/specializations?ids=10&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/traits?ids=11&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/legends?ids=LegendB&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/skills?ids=20%2C21%2C30&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterBuildAsync_degrades_invalid_metadata_batches_with_deterministic_deduplicated_warnings()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            """{"tab":1,"is_active":true,"build":{"name":"Build","profession":"Guardian","specializations":[{"id":10,"traits":[11,11,null]},{"id":null,"traits":[null,null,null]},{"id":null,"traits":[null,null,null]}],"skills":{"heal":20,"utilities":[20,null,null],"elite":null},"aquatic_skills":{"heal":null,"utilities":[null,null,null],"elite":null}}}""",
+            new ResponseSpec("""[{"id":10,"name":"Invocation"}]""", HttpStatusCode.PartialContent),
+            new ResponseSpec("""[{"id":11,"name":"Trait"},{"id":11,"name":"Duplicate"}]"""), new ResponseSpec("private skill body", HttpStatusCode.NotFound));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var build = await client.GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.False(build.IsMetadataComplete);
+        Assert.Equal([("specializations", "10"), ("traits", "11"), ("skills", "20")], build.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+        Assert.Null(build.Specializations[0].Specialization!.Name);
+        Assert.Null(build.Specializations[0].SelectedTraits[0]!.Name);
+        Assert.Null(build.TerrestrialSkills.Heal!.Name);
+    }
+
+    [Fact]
+    public async Task GetCharacterBuildAsync_accepts_a_nonempty_206_strict_subset_and_only_valid_legends_feed_swap_skills()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            """{"tab":1,"is_active":true,"build":{"name":"Build","profession":"Revenant","specializations":[{"id":null,"traits":[null,null,null]},{"id":null,"traits":[null,null,null]},{"id":null,"traits":[null,null,null]}],"skills":{"heal":null,"utilities":[null,null,null],"elite":null},"aquatic_skills":{"heal":null,"utilities":[null,null,null],"elite":null},"legends":["LegendA","LegendB"],"aquatic_legends":[null,null]}}""",
+            new ResponseSpec("""[{"id":"LegendB","code":7,"swap":30}]""", HttpStatusCode.PartialContent),
+            """[{"id":30,"name":"Swap"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var build = await client.GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.False(build.IsMetadataComplete);
+        Assert.Equal([("legends", "LegendA")], build.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+        Assert.Null(build.Legends!.Terrestrial[0]!.Code);
+        Assert.Null(build.Legends.Terrestrial[0]!.SwapSkill);
+        Assert.Equal((7, 30, "Swap"), (build.Legends.Terrestrial[1]!.Code, build.Legends.Terrestrial[1]!.SwapSkill!.Id, build.Legends.Terrestrial[1]!.SwapSkill!.Name));
+        Assert.Equal(5, handler.RequestUris.Count);
+        Assert.Equal("/v2/skills?ids=30&lang=en&v=2025-08-29T01%3A00%3A00.000Z", handler.RequestUris[^1]);
+    }
+
+    [Fact]
+    public async Task GetCharacterBuildAsync_rejects_inactive_or_malformed_authenticated_build_without_resolvers()
+    {
+        foreach (var payload in new[]
+        {
+            """{"tab":1,"is_active":false,"build":{}}""",
+            """{"tab":1,"is_active":true,"build":{"name":"Build","profession":"Guardian","specializations":[]}}""",
+            """{"tab":1,"tab":2,"is_active":true,"build":{}}"""
+        })
+        {
+            var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""", payload);
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+            var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None));
+
+            Assert.Contains("character-build response", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(3, handler.RequestUris.Count);
+        }
+    }
+
+    [Fact]
+    public async Task GetCharacterBuildAsync_propagates_caller_cancellation_before_traversal_continues()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""")
+        {
+            OnRequest = cancellationSource.Cancel
+        };
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.GetCharacterBuildAsync("Synthetic Hero", cancellationSource.Token));
+
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterBuildAsync_enriches_valid_numeric_206_rows_and_warns_only_omitted_ids()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            ActiveBuild("Guardian", "[{\"id\":10,\"traits\":[null,null,null]},{\"id\":20,\"traits\":[null,null,null]},{\"id\":null,\"traits\":[null,null,null]}]"),
+            new ResponseSpec("""[{"id":10,"name":"First"}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var build = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal("First", build.Specializations[0].Specialization!.Name);
+        Assert.Null(build.Specializations[1].Specialization!.Name);
+        Assert.Equal([("specializations", "20")], build.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidLegendBatches))]
+    public async Task GetCharacterBuildAsync_invalid_or_missing_legends_retain_ids_warn_and_do_not_feed_skills(ResponseSpec response)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            ActiveBuild("Revenant", conditional: ",\"legends\":[\"LegendA\",null],\"aquatic_legends\":[null,null]"), response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var build = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal(("LegendA", (int?)null, (Gw2NumericReference?)null), (build.Legends!.Terrestrial[0]!.Id, build.Legends.Terrestrial[0]!.Code, build.Legends.Terrestrial[0]!.SwapSkill));
+        Assert.Equal([("legends", "LegendA")], build.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.StartsWith("/v2/skills?", StringComparison.Ordinal));
+    }
+
+    public static TheoryData<ResponseSpec> InvalidLegendBatches => new()
+    {
+        { new ResponseSpec("private legend response", HttpStatusCode.NotFound) },
+        { new ResponseSpec("""[{"id":"LegendA","code":7,"swap":30},{"id":"LegendA","code":8,"swap":31}]""") }
+    };
+
+    [Theory]
+    [InlineData("http")]
+    [InlineData("timeout")]
+    public async Task GetCharacterBuildAsync_failed_skills_preserve_legend_identity_and_metadata_failures_continue(string failureKind)
+    {
+        Exception skillFailure = failureKind == "http" ? new HttpRequestException("public skills unavailable") : new OperationCanceledException("public skills timed out");
+        var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            ActiveBuild("Revenant", conditional: ",\"legends\":[\"LegendA\",null],\"aquatic_legends\":[null,null]"),
+            """[{"id":"LegendA","code":7,"swap":30}]""", skillFailure);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var build = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        var legend = build.Legends!.Terrestrial[0]!;
+        Assert.Equal((7, 30, (string?)null), (legend.Code, legend.SwapSkill!.Id, legend.SwapSkill.Name));
+        Assert.Equal([("skills", "30")], build.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+    }
+
+    [Theory]
+    [InlineData("transport")]
+    [InlineData("timeout")]
+    public async Task GetCharacterBuildAsync_specialization_metadata_failure_degrades_only_its_batch_and_continues(string failureKind)
+    {
+        Exception failure = failureKind == "transport" ? new HttpRequestException("public specializations unavailable") : new OperationCanceledException("public specializations timed out");
+        var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            ActiveBuild("Guardian", "[{\"id\":10,\"traits\":[11,null,null]},{\"id\":null,\"traits\":[null,null,null]},{\"id\":null,\"traits\":[null,null,null]}]", "{\"heal\":20,\"utilities\":[null,null,null],\"elite\":null}"),
+            failure, """[{"id":11,"name":"Trait"}]""", """[{"id":20,"name":"Heal"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var build = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Null(build.Specializations[0].Specialization!.Name);
+        Assert.Equal("Trait", build.Specializations[0].SelectedTraits[0]!.Name);
+        Assert.Equal("Heal", build.TerrestrialSkills.Heal!.Name);
+        Assert.Equal([("specializations", "10")], build.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+    }
+
+    [Fact]
+    public async Task GetCharacterBuildAsync_parses_ranger_pets_and_tolerates_unknown_authenticated_fields()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""",
+            ActiveBuild("Ranger", conditional: ",\"pets\":{\"terrestrial\":[1,null],\"aquatic\":[null,2]}", outer: ",\"future_outer\":true", buildExtra: ",\"future_build\":true"),
+            """[{"id":1,"name":"First Pet"},{"id":2,"name":"Second Pet"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var build = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Null(build.Legends);
+        Assert.Equal(("First Pet", (string?)null, (string?)null, "Second Pet"), (build.Pets!.Terrestrial[0]!.Name, build.Pets.Terrestrial[1]?.Name, build.Pets.Aquatic[0]?.Name, build.Pets.Aquatic[1]!.Name));
+        Assert.True(build.IsMetadataComplete);
+    }
+
+    [Theory]
+    [MemberData(nameof(ContradictoryConditionalBuilds))]
+    public async Task GetCharacterBuildAsync_rejects_conditional_contradictions_and_non_ok_active_responses_without_resolvers(ResponseSpec activeResponse)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","characters","builds"]}""", """["Synthetic Hero"]""", activeResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterBuildAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<ResponseSpec> ContradictoryConditionalBuilds => new()
+    {
+        { new ResponseSpec(ActiveBuild("Ranger", conditional: ",\"pets\":{\"terrestrial\":[null,null],\"aquatic\":[null,null]},\"legends\":[null,null],\"aquatic_legends\":[null,null]")) },
+        { new ResponseSpec(ActiveBuild("Revenant", conditional: ",\"pets\":{\"terrestrial\":[null,null],\"aquatic\":[null,null]},\"legends\":[null,null],\"aquatic_legends\":[null,null]")) },
+        { new ResponseSpec("private active", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("private active", HttpStatusCode.InternalServerError) }
+    };
+
+    private static string ActiveBuild(string profession, string? specializations = null, string? skills = null, string conditional = "", string outer = "", string buildExtra = "") =>
+        "{\"tab\":1,\"is_active\":true" + outer
+        + ",\"build\":{\"name\":\"Build\",\"profession\":\"" + profession + "\"" + buildExtra
+        + ",\"specializations\":" + (specializations ?? "[{\"id\":null,\"traits\":[null,null,null]},{\"id\":null,\"traits\":[null,null,null]},{\"id\":null,\"traits\":[null,null,null]}]")
+        + ",\"skills\":" + (skills ?? "{\"heal\":null,\"utilities\":[null,null,null],\"elite\":null}")
+        + ",\"aquatic_skills\":{\"heal\":null,\"utilities\":[null,null,null],\"elite\":null}" + conditional + "}}";
+
     private static Dictionary<string, string> PaginationHeaders(
         string pageSize = "200",
         string pageTotal = "1",
@@ -1578,7 +1794,7 @@ public sealed class Gw2ApiClientTests
         string? additionalField = null) =>
         $$"""{"name":"{{name}}","race":"{{race}}","gender":"{{gender}}","profession":"{{profession}}","level":{{level}},"age":{{age}},"created":"{{created}}","last_modified":"{{lastModified}}","deaths":{{deaths}}{{(additionalField is null ? string.Empty : "," + additionalField)}}}""";
 
-    private sealed record ResponseSpec(
+    public sealed record ResponseSpec(
         string Content,
         HttpStatusCode StatusCode = HttpStatusCode.OK,
         TimeSpan? RetryAfter = null,
@@ -1620,6 +1836,7 @@ public sealed class Gw2ApiClientTests
             {
                 string content => new ResponseSpec(content, responses.Count > 0 && responses.Peek() is HttpStatusCode status ? (HttpStatusCode)responses.Dequeue() : HttpStatusCode.OK),
                 ResponseSpec specification => specification,
+                Exception exception => throw exception,
                 _ => throw new InvalidOperationException("Unsupported test response.")
             };
             var message = new HttpResponseMessage(response.StatusCode) { Content = new StringContent(response.Content, Encoding.UTF8, "application/json") };
