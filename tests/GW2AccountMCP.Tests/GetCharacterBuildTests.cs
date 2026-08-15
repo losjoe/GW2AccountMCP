@@ -130,6 +130,8 @@ public sealed class GetCharacterBuildTests
             return Error is null ? Task.FromResult(Build) : Task.FromException<Gw2CharacterBuild>(Error);
         }
 
+        public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
+
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) => throw new NotSupportedException();

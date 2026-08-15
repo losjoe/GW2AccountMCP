@@ -12,6 +12,7 @@ public interface IGw2ApiClient
     Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken);
     Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken);
+    Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
@@ -25,6 +26,13 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const string Language = "en";
     private const int CurrentSellsPageSize = 200;
     private const int MaximumItemBatchSize = 200;
+    private const int MaximumEquipmentRows = 32;
+    private const int MaximumEquipmentReferences = 200;
+    private const int MaximumEquipmentStatAttributes = 32;
+    private const int MaximumFallbackEquipmentRows = 256;
+    private static readonly string[] EquipmentSlotOrder = ["Helm", "Shoulders", "Coat", "Gloves", "Leggings", "Boots", "Backpack", "Accessory1", "Accessory2", "Amulet", "Ring1", "Ring2", "WeaponA1", "WeaponA2", "WeaponB1", "WeaponB2", "HelmAquatic", "WeaponAquaticA", "WeaponAquaticB", "Relic"];
+    private static readonly HashSet<string> KnownSpecialEquipmentSlots = ["Sickle", "Axe", "Pick", "FishingRod", "FishingBait", "FishingLure", "PowerCore", "SensoryArray", "ServiceChip"];
+    private static readonly HashSet<string> KnownInactiveEquipmentLocations = ["Armory", "LegendaryArmory"];
     private static readonly TimeSpan DefaultRetryDelay = TimeSpan.FromMilliseconds(100);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
@@ -222,6 +230,57 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
                 : null,
             warnings.Count == 0,
             warnings);
+    }
+
+    public async Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        if (string.IsNullOrWhiteSpace(characterName)) throw new Gw2ConfigurationException("characterName is required and must not be blank.");
+        await ValidatePermissionsAsync(["account", "characters", "builds", "inventories"], cancellationToken);
+        using var charactersResponse = await SendWithSingleRetryAsync("/v2/characters", cancellationToken);
+        EnsureAuthenticatedOk(charactersResponse, "character-list");
+        var canonicalCharacterName = (await DeserializeCharacterNamesAsync(charactersResponse, cancellationToken))
+            .SingleOrDefault(name => string.Equals(name, characterName, StringComparison.Ordinal));
+        if (canonicalCharacterName is null) throw new Gw2ConfigurationException("The requested character was not found in the authenticated roster.");
+
+        var encodedName = Uri.EscapeDataString(canonicalCharacterName);
+        using var activeResponse = await SendWithSingleRetryAsync($"/v2/characters/{encodedName}/equipmenttabs/active", cancellationToken);
+        EnsureAuthenticatedOk(activeResponse, "character-equipment");
+        var payload = await DeserializeActiveEquipmentAsync(activeResponse, cancellationToken);
+        var rows = payload.Rows.ToList();
+        if (!rows.Any(row => row.Slot == "Relic"))
+        {
+            using var fallbackResponse = await SendWithSingleRetryAsync($"/v2/characters/{encodedName}/equipment", cancellationToken);
+            EnsureAuthenticatedOk(fallbackResponse, "character-equipment");
+            var relic = await DeserializeFallbackRelicAsync(fallbackResponse, cancellationToken);
+            if (relic is not null) rows.Add(relic);
+        }
+
+        if (rows.Count > MaximumEquipmentRows) throw InvalidCharacterEquipmentResponse();
+        var referenceOccurrences = rows.Sum(row => 1 + row.Upgrades.Count + row.Infusions.Count);
+        if (referenceOccurrences > MaximumEquipmentReferences) throw InvalidCharacterEquipmentResponse();
+        rows = rows.OrderBy(row => Array.IndexOf(EquipmentSlotOrder, row.Slot) is var index && index >= 0 ? index : int.MaxValue)
+            .ThenBy(row => Array.IndexOf(EquipmentSlotOrder, row.Slot) >= 0 ? string.Empty : row.Slot, StringComparer.Ordinal).ToList();
+
+        var itemIds = rows.Select(row => row.ItemId).Concat(rows.SelectMany(row => row.Upgrades)).Concat(rows.SelectMany(row => row.Infusions)).Distinct().Order().ToArray();
+        var itemMetadata = await ResolveEquipmentItemsAsync(itemIds, rows.Select(row => row.ItemId).ToHashSet(), cancellationToken);
+        var itemStatIds = rows.Where(row => row.SelectedStatId is not null).Select(row => row.SelectedStatId!.Value)
+            .Concat(rows.Where(row => row.SelectedStatId is null).Select(row => itemMetadata.Rows.GetValueOrDefault(row.ItemId)?.DefaultStatId).Where(id => id is not null).Select(id => id!.Value))
+            .Distinct().Order().ToArray();
+        var itemStats = await ResolveEquipmentNamesAsync("itemstats", itemStatIds, cancellationToken);
+        var skinIds = rows.Where(row => row.SkinId is not null).Select(row => row.SkinId!.Value).Distinct().Order().ToArray();
+        var skins = await ResolveEquipmentNamesAsync("skins", skinIds, cancellationToken);
+        var warnings = new List<Gw2MetadataWarning>();
+        AddEquipmentWarnings(warnings, "items", itemIds, itemMetadata.Rows.Keys);
+        AddEquipmentWarnings(warnings, "itemstats", itemStatIds, itemStats.Rows.Keys);
+        AddEquipmentWarnings(warnings, "skins", skinIds, skins.Rows.Keys);
+        return new Gw2CharacterEquipment(canonicalCharacterName, payload.Tab, payload.Name,
+            rows.Select(row => ToEquipmentRow(row, itemMetadata.Rows, itemStats.Rows, skins.Rows)).ToArray(),
+            warnings.Count == 0, warnings);
     }
 
     public async Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken)
@@ -1050,6 +1109,254 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private static void EnsureAuthenticatedOk(HttpResponseMessage response, string operation)
+    {
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
+        if (response.StatusCode != HttpStatusCode.OK) throw new Gw2ConfigurationException($"GW2 {operation} request failed with HTTP {(int)response.StatusCode}. Try again later.");
+    }
+
+    private async Task<ActiveEquipmentPayload> DeserializeActiveEquipmentAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            var root = EquipmentObject(document.RootElement);
+            var tab = EquipmentInt(root, "tab");
+            if (tab <= 0 || !EquipmentBoolean(root, "is_active")) throw InvalidCharacterEquipmentResponse();
+            var equipment = EquipmentArray(root, "equipment");
+            if (equipment.GetArrayLength() > MaximumEquipmentRows) throw InvalidCharacterEquipmentResponse();
+            var rows = new List<AuthenticatedEquipmentRow>();
+            foreach (var element in equipment.EnumerateArray())
+            {
+                var row = EquipmentObject(element);
+                var slot = EquipmentString(row, "slot", false);
+                if (KnownSpecialEquipmentSlots.Contains(slot)) continue;
+                var parsed = ParseEquipmentRow(row, slot, primary: true);
+                if (rows.Any(existing => existing.Slot == parsed.Slot)) throw InvalidCharacterEquipmentResponse();
+                rows.Add(parsed);
+            }
+            return new ActiveEquipmentPayload(tab, EquipmentString(root, "name", true), rows);
+        }
+        catch (JsonException) { throw InvalidCharacterEquipmentResponse(); }
+    }
+
+    private async Task<AuthenticatedEquipmentRow?> DeserializeFallbackRelicAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            var equipment = EquipmentArray(EquipmentObject(document.RootElement), "equipment");
+            if (equipment.GetArrayLength() > MaximumFallbackEquipmentRows) throw InvalidCharacterEquipmentResponse();
+            AuthenticatedEquipmentRow? candidate = null;
+            foreach (var element in equipment.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object || !TryEquipmentString(element, "slot", out var slot) || slot != "Relic") continue;
+                var location = EquipmentString(element, "location", false);
+                if (KnownInactiveEquipmentLocations.Contains(location)) continue;
+                if (location is not "Equipped" and not "EquippedFromLegendaryArmory") throw InvalidCharacterEquipmentResponse();
+                if (candidate is not null) throw InvalidCharacterEquipmentResponse();
+                candidate = ParseEquipmentRow(element, slot, primary: false);
+            }
+            return candidate;
+        }
+        catch (JsonException) { throw InvalidCharacterEquipmentResponse(); }
+    }
+
+    private static AuthenticatedEquipmentRow ParseEquipmentRow(JsonElement row, string slot, bool primary)
+    {
+        var itemId = EquipmentLong(row, "id");
+        if (itemId <= 0) throw InvalidCharacterEquipmentResponse();
+        var location = EquipmentString(row, "location", false);
+        if (primary && KnownInactiveEquipmentLocations.Contains(location)) throw InvalidCharacterEquipmentResponse();
+        var skinId = OptionalPositiveLong(row, "skin");
+        var upgrades = OptionalPositiveLongArray(row, "upgrades");
+        var infusions = OptionalPositiveLongArray(row, "infusions");
+        var binding = OptionalNullableString(row, "binding");
+        var boundTo = OptionalNullableString(row, "bound_to");
+        if ((binding == "Character" && boundTo is null) || ((binding is null or "Account") && boundTo is not null)) throw InvalidCharacterEquipmentResponse();
+        long? selectedStatId = null;
+        IReadOnlyList<Gw2EquipmentStatAttribute>? selectedAttributes = null;
+        if (TryEquipmentProperty(row, "stats", out var stats))
+        {
+            var statsObject = EquipmentObject(stats);
+            selectedStatId = EquipmentLong(statsObject, "id");
+            if (selectedStatId <= 0) throw InvalidCharacterEquipmentResponse();
+            var attributes = EquipmentObject(EquipmentProperty(statsObject, "attributes"));
+            var pairs = new List<Gw2EquipmentStatAttribute>();
+            foreach (var attribute in attributes.EnumerateObject())
+            {
+                if (string.IsNullOrWhiteSpace(attribute.Name) || attribute.Value.ValueKind != JsonValueKind.Number || !attribute.Value.TryGetInt32(out var value)) throw InvalidCharacterEquipmentResponse();
+                if (pairs.Any(pair => pair.Name == attribute.Name)) throw InvalidCharacterEquipmentResponse();
+                pairs.Add(new Gw2EquipmentStatAttribute(attribute.Name, value));
+            }
+            if (pairs.Count > MaximumEquipmentStatAttributes) throw InvalidCharacterEquipmentResponse();
+            selectedAttributes = pairs.Count == 0 ? null : pairs.OrderBy(pair => pair.Name, StringComparer.Ordinal).ToArray();
+        }
+        var referenceKind = location == "Equipped" ? "EquippedReference" : location == "EquippedFromLegendaryArmory" ? "LegendaryArmoryReference" : "UnknownEquipmentReference";
+        return new AuthenticatedEquipmentRow(slot, itemId, skinId, upgrades, infusions, binding, boundTo, location, referenceKind, selectedStatId, selectedAttributes);
+    }
+
+    private async Task<EquipmentItemBatch> ResolveEquipmentItemsAsync(IReadOnlyList<long> requestedIds, IReadOnlySet<long> primaryIds, CancellationToken cancellationToken)
+    {
+        if (requestedIds.Count == 0) return new(new Dictionary<long, EquipmentItemMetadata>());
+        try
+        {
+            using var response = await SendWithSingleRetryAsync($"/v2/items?ids={Uri.EscapeDataString(string.Join(',', requestedIds))}", cancellationToken, authenticated: false);
+            if (response.StatusCode == HttpStatusCode.NotFound) return new(new Dictionary<long, EquipmentItemMetadata>());
+            if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) return new(new Dictionary<long, EquipmentItemMetadata>());
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return new(new Dictionary<long, EquipmentItemMetadata>());
+            var rows = new Dictionary<long, EquipmentItemMetadata>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                var item = EquipmentObject(element);
+                var id = EquipmentLong(item, "id");
+                var name = EquipmentString(item, "name", true);
+                if (id <= 0 || !requestedIds.Contains(id) || !rows.TryAdd(id, ParseEquipmentItemMetadata(item, id, name, primaryIds.Contains(id)))) return new(new Dictionary<long, EquipmentItemMetadata>());
+            }
+            if ((response.StatusCode == HttpStatusCode.OK && rows.Count != requestedIds.Count)
+                || (response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || rows.Count == requestedIds.Count))) return new(new Dictionary<long, EquipmentItemMetadata>());
+            return new(rows);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return new(new Dictionary<long, EquipmentItemMetadata>()); }
+    }
+
+    private static EquipmentItemMetadata ParseEquipmentItemMetadata(JsonElement item, long id, string name, bool primary)
+    {
+        if (!primary) return new(id, name, null, null, null, null, null);
+        var type = EquipmentString(item, "type", false);
+        var rarity = EquipmentString(item, "rarity", false);
+        var level = EquipmentInt(item, "level");
+        if (level < 0) throw InvalidCharacterEquipmentResponse();
+        string? subtype = null;
+        long? defaultStatId = null;
+        if (TryEquipmentProperty(item, "details", out var detailsValue))
+        {
+            var details = EquipmentObject(detailsValue);
+            if (TryEquipmentProperty(details, "type", out var typeValue))
+            {
+                if (typeValue.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(typeValue.GetString())) throw InvalidCharacterEquipmentResponse();
+                subtype = typeValue.GetString();
+            }
+            if (TryEquipmentProperty(details, "infix_upgrade", out var infixValue))
+            {
+                var infix = EquipmentObject(infixValue);
+                if (TryEquipmentProperty(infix, "id", out var idValue))
+                {
+                    if (idValue.ValueKind != JsonValueKind.Number || !idValue.TryGetInt64(out var parsedDefaultStatId) || parsedDefaultStatId <= 0) throw InvalidCharacterEquipmentResponse();
+                    defaultStatId = parsedDefaultStatId;
+                }
+            }
+        }
+        return new(id, name, type, subtype, rarity, level, defaultStatId);
+    }
+
+    private async Task<EquipmentNameBatch> ResolveEquipmentNamesAsync(string resolver, IReadOnlyList<long> requestedIds, CancellationToken cancellationToken)
+    {
+        if (requestedIds.Count == 0) return new(new Dictionary<long, string>());
+        try
+        {
+            using var response = await SendWithSingleRetryAsync($"/v2/{resolver}?ids={Uri.EscapeDataString(string.Join(',', requestedIds))}", cancellationToken, authenticated: false);
+            if (response.StatusCode == HttpStatusCode.NotFound) return new(new Dictionary<long, string>());
+            if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) return new(new Dictionary<long, string>());
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return new(new Dictionary<long, string>());
+            var rows = new Dictionary<long, string>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                var row = EquipmentObject(element);
+                var id = EquipmentLong(row, "id");
+                var name = EquipmentString(row, "name", false);
+                if (id <= 0 || !requestedIds.Contains(id) || !rows.TryAdd(id, name)) return new(new Dictionary<long, string>());
+            }
+            if ((response.StatusCode == HttpStatusCode.OK && rows.Count != requestedIds.Count)
+                || (response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || rows.Count == requestedIds.Count))) return new(new Dictionary<long, string>());
+            return new(rows);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return new(new Dictionary<long, string>()); }
+    }
+
+    private static Gw2EquipmentRow ToEquipmentRow(AuthenticatedEquipmentRow row, IReadOnlyDictionary<long, EquipmentItemMetadata> items, IReadOnlyDictionary<long, string> stats, IReadOnlyDictionary<long, string> skins)
+    {
+        items.TryGetValue(row.ItemId, out var item);
+        var statId = row.SelectedStatId ?? item?.DefaultStatId;
+        var stat = statId is null ? null : new Gw2EquipmentStat(statId.Value, stats.GetValueOrDefault(statId.Value), row.SelectedStatId is null ? "ItemDefault" : "Selected", row.SelectedStatId is null ? null : row.SelectedAttributes);
+        return new Gw2EquipmentRow(row.Slot, new Gw2EquipmentItem(row.ItemId, item?.Name, item?.Type, item?.Subtype, item?.Rarity, item?.Level), stat,
+            row.Upgrades.Select(id => new Gw2EquipmentReference(id, items.GetValueOrDefault(id)?.Name)).ToArray(), row.Infusions.Select(id => new Gw2EquipmentReference(id, items.GetValueOrDefault(id)?.Name)).ToArray(),
+            row.SkinId is { } skinId ? new Gw2EquipmentReference(skinId, skins.GetValueOrDefault(skinId)) : null, row.Binding, row.BoundTo, row.Location, row.ReferenceKind);
+    }
+
+    private static void AddEquipmentWarnings(List<Gw2MetadataWarning> warnings, string resolver, IEnumerable<long> requested, IEnumerable<long> resolved)
+    {
+        var resolvedSet = resolved.ToHashSet();
+        warnings.AddRange(requested.Distinct().Where(id => !resolvedSet.Contains(id)).Order().Select(id => new Gw2MetadataWarning("metadata_unresolved", resolver, id.ToString(CultureInfo.InvariantCulture))));
+    }
+
+    private static JsonElement EquipmentProperty(JsonElement element, string name)
+    {
+        var matches = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (matches.Length != 1) throw InvalidCharacterEquipmentResponse();
+        return matches[0].Value;
+    }
+    private static bool TryEquipmentProperty(JsonElement element, string name, out JsonElement value)
+    {
+        var matches = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (matches.Length > 1) throw InvalidCharacterEquipmentResponse();
+        value = matches.Length == 1 ? matches[0].Value : default;
+        return matches.Length == 1;
+    }
+    private static JsonElement EquipmentObject(JsonElement element) => element.ValueKind == JsonValueKind.Object ? element : throw InvalidCharacterEquipmentResponse();
+    private static JsonElement EquipmentArray(JsonElement element, string name) => EquipmentProperty(element, name).ValueKind == JsonValueKind.Array ? EquipmentProperty(element, name) : throw InvalidCharacterEquipmentResponse();
+    private static string EquipmentString(JsonElement element, string name, bool allowEmpty)
+    {
+        var value = EquipmentProperty(element, name);
+        if (value.ValueKind != JsonValueKind.String || (!allowEmpty && string.IsNullOrWhiteSpace(value.GetString()))) throw InvalidCharacterEquipmentResponse();
+        return value.GetString()!;
+    }
+    private static bool TryEquipmentString(JsonElement element, string name, out string? value)
+    {
+        value = null;
+        return TryEquipmentProperty(element, name, out var property) && property.ValueKind == JsonValueKind.String && (value = property.GetString()) is not null;
+    }
+    private static long EquipmentLong(JsonElement element, string name)
+    {
+        var value = EquipmentProperty(element, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number)) throw InvalidCharacterEquipmentResponse();
+        return number;
+    }
+    private static int EquipmentInt(JsonElement element, string name)
+    {
+        var value = EquipmentProperty(element, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var number)) throw InvalidCharacterEquipmentResponse();
+        return number;
+    }
+    private static bool EquipmentBoolean(JsonElement element, string name) => EquipmentProperty(element, name).ValueKind == JsonValueKind.True ? true : EquipmentProperty(element, name).ValueKind == JsonValueKind.False ? false : throw InvalidCharacterEquipmentResponse();
+    private static long? OptionalPositiveLong(JsonElement element, string name)
+    {
+        if (!TryEquipmentProperty(element, name, out var value)) return null;
+        if (value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number) || number <= 0) throw InvalidCharacterEquipmentResponse();
+        return number;
+    }
+    private static IReadOnlyList<long> OptionalPositiveLongArray(JsonElement element, string name)
+    {
+        if (!TryEquipmentProperty(element, name, out var value)) return [];
+        if (value.ValueKind != JsonValueKind.Array) throw InvalidCharacterEquipmentResponse();
+        return value.EnumerateArray().Select(item => item.ValueKind == JsonValueKind.Number && item.TryGetInt64(out var id) && id > 0 ? id : throw InvalidCharacterEquipmentResponse()).ToArray();
+    }
+    private static string? OptionalNullableString(JsonElement element, string name)
+    {
+        if (!TryEquipmentProperty(element, name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString())) throw InvalidCharacterEquipmentResponse();
+        return value.GetString();
+    }
+
     private static async Task<bool> IsInvalidKeyResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         var body = await response.Content.ReadAsStringAsync(cancellationToken);
@@ -1137,6 +1444,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
+    private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
 
     private sealed record ActiveBuildPayload(int Tab, string Name, string Profession, IReadOnlyList<SpecializationSlot> Specializations, SkillSlots TerrestrialSkills, SkillSlots AquaticSkills, PetSlots? Pets, LegendSlots? Legends);
     private sealed record SpecializationSlot(int? Id, IReadOnlyList<int?> Traits);
@@ -1177,6 +1485,11 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         DateTimeOffset? Created);
     private sealed record CurrentSellsPagination(long PageSize, int PageTotal, long ResultCount, long ResultTotal);
     private sealed record ItemResponse(long? Id, string? Name);
+    private sealed record ActiveEquipmentPayload(int Tab, string Name, IReadOnlyList<AuthenticatedEquipmentRow> Rows);
+    private sealed record AuthenticatedEquipmentRow(string Slot, long ItemId, long? SkinId, IReadOnlyList<long> Upgrades, IReadOnlyList<long> Infusions, string? Binding, string? BoundTo, string Location, string ReferenceKind, long? SelectedStatId, IReadOnlyList<Gw2EquipmentStatAttribute>? SelectedAttributes);
+    private sealed record EquipmentItemBatch(IReadOnlyDictionary<long, EquipmentItemMetadata> Rows);
+    private sealed record EquipmentNameBatch(IReadOnlyDictionary<long, string> Rows);
+    private sealed record EquipmentItemMetadata(long Id, string Name, string? Type, string? Subtype, string? Rarity, int? Level, long? DefaultStatId);
 }
 
 public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
@@ -1227,6 +1540,12 @@ public sealed record Gw2BuildLegends(IReadOnlyList<Gw2LegendReference?> Terrestr
 public sealed record Gw2NumericReference(int Id, string? Name);
 public sealed record Gw2LegendReference(string Id, int? Code, Gw2NumericReference? SwapSkill);
 public sealed record Gw2MetadataWarning(string Code, string Resolver, string ReferenceId);
+public sealed record Gw2CharacterEquipment(string CharacterName, int Tab, string EquipmentTabName, IReadOnlyList<Gw2EquipmentRow> Equipment, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
+public sealed record Gw2EquipmentRow(string Slot, Gw2EquipmentItem Item, Gw2EquipmentStat? Stats, IReadOnlyList<Gw2EquipmentReference> Upgrades, IReadOnlyList<Gw2EquipmentReference> Infusions, Gw2EquipmentReference? Skin, string? Binding, string? BoundTo, string Location, string ReferenceKind);
+public sealed record Gw2EquipmentItem(long Id, string? Name, string? Type, string? Subtype, string? Rarity, int? Level);
+public sealed record Gw2EquipmentStat(long Id, string? Name, string Source, IReadOnlyList<Gw2EquipmentStatAttribute>? Attributes);
+public sealed record Gw2EquipmentStatAttribute(string Name, int Value);
+public sealed record Gw2EquipmentReference(long Id, string? Name);
 public enum Gw2StorageSource
 {
     Bank,

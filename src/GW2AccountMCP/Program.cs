@@ -33,6 +33,7 @@ builder.Services
     .WithTools<GetAccountTool>()
     .WithTools<GetAccountHoldingsTool>()
     .WithTools<GetCharacterBuildTool>()
+    .WithTools<GetCharacterEquipmentTool>()
     .WithTools<GetCharactersTool>()
     .WithTools<GetWalletTool>();
 

@@ -17,7 +17,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_six_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_seven_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -27,7 +27,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_characters", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_characters", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -102,6 +102,17 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         var characterBuildOutput = characterBuild.GetProperty("outputSchema").GetProperty("properties");
         Assert.Equal(["characterName", "tab", "buildName", "profession", "specializations", "skills", "pets", "legends", "isMetadataComplete", "warnings", "asOf"], characterBuildOutput.EnumerateObject().Select(property => property.Name));
         Assert.Equal(["characterName", "tab", "buildName", "profession", "specializations", "skills", "pets", "legends", "isMetadataComplete", "warnings", "asOf"], characterBuild.GetProperty("outputSchema").GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+
+        var characterEquipment = toolsByName["get_character_equipment"];
+        Assert.Equal(["characterName"], characterEquipment.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["characterName"], characterEquipment.GetProperty("inputSchema").GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var characterEquipmentOutput = characterEquipment.GetProperty("outputSchema");
+        Assert.Equal(["characterName", "tab", "equipmentTabName", "equipment", "isOwnershipData", "isMetadataComplete", "warnings", "asOf"], characterEquipmentOutput.GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["characterName", "tab", "equipmentTabName", "equipment", "isOwnershipData", "isMetadataComplete", "warnings", "asOf"], characterEquipmentOutput.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var equipmentRowSchema = characterEquipmentOutput.GetProperty("properties").GetProperty("equipment").GetProperty("items");
+        Assert.Equal(["slot", "item", "stats", "upgrades", "infusions", "skin", "binding", "boundTo", "location", "referenceKind"], equipmentRowSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var equipmentItemSchema = equipmentRowSchema.GetProperty("properties").GetProperty("item");
+        Assert.Equal(["id", "name", "type", "subtype", "rarity", "level"], equipmentItemSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
     }
 
     [Fact]
@@ -268,6 +279,26 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.Equal(3, specializations[0].GetProperty("selectedTraits").GetArrayLength());
         Assert.Equal(3, structured.GetProperty("skills").GetProperty("terrestrial").GetProperty("utilities").GetArrayLength());
         Assert.Equal(JsonValueKind.Null, structured.GetProperty("skills").GetProperty("terrestrial").GetProperty("heal").GetProperty("name").ValueKind);
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipment_returns_structured_compact_equipment()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(14, "tools/call", new { name = "get_character_equipment", arguments = new { characterName = "Synthetic Hero" } });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal("Synthetic Hero", structured.GetProperty("characterName").GetString());
+        Assert.False(structured.GetProperty("isOwnershipData").GetBoolean());
+        var row = Assert.Single(structured.GetProperty("equipment").EnumerateArray());
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("item").GetProperty("name").ValueKind);
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("stats").ValueKind);
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("skin").ValueKind);
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("binding").ValueKind);
+        Assert.Equal(JsonValueKind.Null, row.GetProperty("boundTo").ValueKind);
         Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
     }
 
@@ -466,6 +497,11 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
                 new Gw2BuildSkills(null, [null, null, null], null),
                 null, null, false, [new Gw2MetadataWarning("metadata_unresolved", "skills", "20")]));
 
+        public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2CharacterEquipment("Synthetic Hero", 1, "", [
+                new Gw2EquipmentRow("Helm", new Gw2EquipmentItem(1, null, null, null, null, null), null, [], [], null, null, null, "Equipped", "EquippedReference")
+            ], true, []));
+
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2AccountStorage([new Gw2StorageStack(101, 2, Gw2StorageSource.Bank, 0)]));
 
@@ -497,6 +533,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required builds permission. Create a key with the builds permission.");
 
+        public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required builds permission. Create a key with the builds permission.");
+
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required inventories permission. Create a key with the inventories permission.");
 
@@ -526,6 +565,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             throw new NotSupportedException();
 
         public Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("Synthetic storage failure.");

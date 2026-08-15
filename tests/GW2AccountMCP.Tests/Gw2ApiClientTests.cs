@@ -8,6 +8,303 @@ namespace GW2AccountMCP.Tests;
 public sealed class Gw2ApiClientTests
 {
     [Fact]
+    public async Task GetCharacterEquipmentAsync_selects_exact_roster_name_and_uses_encoded_active_route()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds","inventories"]}""",
+            """["Other Hero","Path/Query?# Hero"]""",
+            """{"tab":1,"name":"","is_active":true,"equipment":[],"equipment_pvp":[{}]}""",
+            """{"equipment":[]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var equipment = await client.GetCharacterEquipmentAsync("Path/Query?# Hero", CancellationToken.None);
+
+        Assert.Equal("Path/Query?# Hero", equipment.CharacterName);
+        Assert.Equal(
+            ["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Path%2FQuery%3F%23%20Hero/equipmenttabs/active?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Path%2FQuery%3F%23%20Hero/equipment?lang=en&v=2025-08-29T01%3A00%3A00.000Z"],
+            handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_filters_special_slots_recovers_relic_and_preserves_repeated_references()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds","inventories"]}""",
+            """["Synthetic Hero"]""",
+            """{"tab":2,"name":"","is_active":true,"equipment":[{"slot":"Sickle"},{"slot":"WeaponB1","id":1,"location":"Equipped","upgrades":[2,2],"infusions":[3],"skin":4,"stats":{"id":5,"attributes":{"Zeta":2,"Alpha":1}}},{"slot":"Helm","id":8,"location":"Equipped"}],"equipment_pvp":"ignored"}""",
+            """{"equipment":[{"slot":"Relic","id":6,"location":"EquippedFromLegendaryArmory"}]}""",
+            """[{"id":1,"name":"","type":"Weapon","rarity":"Rare","level":80,"details":{"type":"Sword","infix_upgrade":{"id":7}}},{"id":2,"name":"Upgrade"},{"id":3,"name":"Infusion"},{"id":6,"name":"Relic","type":"UpgradeComponent","rarity":"Exotic","level":0},{"id":8,"name":"Helm","type":"Armor","rarity":"Fine","level":1,"details":{"infix_upgrade":{"id":9}}}]""",
+            """[{"id":5,"name":"Selected"},{"id":9,"name":"Default"}]""",
+            """[{"id":4,"name":"Skin"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var equipment = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"))
+            .GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal(["Helm", "WeaponB1", "Relic"], equipment.Equipment.Select(row => row.Slot));
+        var helm = equipment.Equipment[0];
+        Assert.Equal((9L, "Default", "ItemDefault"), (helm.Stats!.Id, helm.Stats.Name, helm.Stats.Source));
+        Assert.Null(helm.Stats.Attributes);
+        var weapon = equipment.Equipment[1];
+        Assert.Equal([2L, 2L], weapon.Upgrades.Select(upgrade => upgrade.Id));
+        Assert.Equal(["Alpha", "Zeta"], weapon.Stats!.Attributes!.Select(attribute => attribute.Name));
+        Assert.Equal("EquippedReference", weapon.ReferenceKind);
+        Assert.Equal("LegendaryArmoryReference", equipment.Equipment[2].ReferenceKind);
+        Assert.True(equipment.IsMetadataComplete);
+        Assert.Equal(
+            ["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Synthetic%20Hero/equipmenttabs/active?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Synthetic%20Hero/equipment?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/items?ids=1%2C2%2C3%2C6%2C8&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/itemstats?ids=5%2C9&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/skins?ids=4&lang=en&v=2025-08-29T01%3A00%3A00.000Z"],
+            handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_discards_malformed_public_metadata_and_returns_ordered_warnings()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","builds","inventories"]}""", """["Synthetic Hero"]""",
+            """{"tab":1,"name":"tab","is_active":true,"equipment":[{"slot":"Helm","id":2,"location":"FutureLocation","stats":{"id":3,"attributes":{}}},{"slot":"Relic","id":1,"location":"Equipped","skin":4}],"equipment_pvp":[]}""",
+            """[{"id":1,"name":"Relic","type":"UpgradeComponent","rarity":"Rare","level":0},{"id":2,"name":"Helm","type":"Armor","rarity":"Rare","level":0}]""",
+            new ResponseSpec("[]", HttpStatusCode.PartialContent),
+            new ResponseSpec("[]", HttpStatusCode.NotFound));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var equipment = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"))
+            .GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal("UnknownEquipmentReference", equipment.Equipment[0].ReferenceKind);
+        Assert.False(equipment.IsMetadataComplete);
+        Assert.Equal([("itemstats", "3"), ("skins", "4")], equipment.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+        Assert.Null(equipment.Equipment[0].Stats!.Name);
+    }
+
+    [Theory]
+    [MemberData(nameof(OverBoundPrimaryEquipment))]
+    public async Task GetCharacterEquipmentAsync_rejects_bounds_without_metadata_or_truncation(string equipment, int expectedAuthenticatedCalls)
+    {
+        var responses = new List<object> { EquipmentPermissions, EquipmentRoster, ActiveEquipment(equipment) };
+        if (expectedAuthenticatedCalls == 4) responses.Add("""{"equipment":[]}""");
+        var handler = new RecordingHandler(responses.ToArray());
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(expectedAuthenticatedCalls, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/v2/items?", StringComparison.Ordinal));
+    }
+
+    public static TheoryData<string, int> OverBoundPrimaryEquipment => new()
+    {
+        { "[" + string.Join(',', Enumerable.Range(1, 33).Select(_ => "{\"slot\":\"Sickle\"}")) + "]", 3 },
+        { "[" + EquipmentRow("Helm", 1, ",\"upgrades\":[" + string.Join(',', Enumerable.Range(2, 200).Append(1).Select(id => id.ToString())) + "]") + "]", 4 },
+        { "[" + EquipmentRow("Helm", 1, ",\"stats\":{\"id\":2,\"attributes\":{" + string.Join(',', Enumerable.Range(1, 33).Select(id => "\"A" + id + "\":" + id)) + "}}") + "]", 3 }
+    };
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_rejects_final_retained_bound_after_recovered_relic()
+    {
+        var primaryRows = "[" + string.Join(',', Enumerable.Range(1, 32).Select(id => EquipmentRow("Future" + id, id))) + "]";
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment(primaryRows), """{"equipment":[{"slot":"Relic","id":33,"location":"Equipped"}]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(4, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/v2/items?", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_rejects_over_bound_fallback_before_metadata()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[]"), "{" + "\"equipment\":[" + string.Join(',', Enumerable.Repeat("null", 257)) + "]}");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(4, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidPrimaryEquipment))]
+    public async Task GetCharacterEquipmentAsync_rejects_retained_authenticated_contradictions(string equipment)
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment(equipment));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<string> InvalidPrimaryEquipment => new()
+    {
+        { "[" + EquipmentRow("Helm", 1) + "," + EquipmentRow("Helm", 2) + "]" },
+        { "[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Armory\"}]" },
+        { "[{\"slot\":\"Helm\",\"id\":1,\"location\":\"LegendaryArmory\"}]" },
+        { "[" + EquipmentRow("Helm", 1, ",\"binding\":\"Character\"") + "]" },
+        { "[" + EquipmentRow("Helm", 1, ",\"binding\":\"Account\",\"bound_to\":\"Synthetic Hero\"") + "]" }
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidFallbackRelics))]
+    public async Task GetCharacterEquipmentAsync_rejects_ambiguous_or_unknown_fallback_relics(string fallback)
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[]"), fallback);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(4, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<string> InvalidFallbackRelics => new()
+    {
+        { """{"equipment":[{"slot":"Relic","location":"FutureLocation"}]}""" },
+        { """{"equipment":[{"slot":"Relic","id":1,"location":"Equipped"},{"slot":"Relic","id":2,"location":"EquippedFromLegendaryArmory"}]}""" }
+    };
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_ignores_unrelated_and_inactive_fallback_rows_when_no_active_relic_exists()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[]"), """{"equipment":[null,{"slot":3},{"slot":"Helm"},{"slot":"Relic","location":"Armory"},{"slot":"Relic","location":"LegendaryArmory"}]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var equipment = await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Empty(equipment.Equipment);
+        Assert.True(equipment.IsMetadataComplete);
+        Assert.Equal(4, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_accepts_primary_relic_without_requesting_fallback()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[" + EquipmentRow("Relic", 1) + "]"), """[{"id":1,"name":"Relic","type":"UpgradeComponent","rarity":"Rare","level":0}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var equipment = await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Single(equipment.Equipment);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/equipment?", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_retains_unknown_primary_slot_and_location()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("""[{"slot":"FutureCombatSlot","id":1,"location":"FutureLocation"}]"""), """{"equipment":[]}""", """[{"id":1,"name":"Future item","type":"Armor","rarity":"Rare","level":0}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var row = Assert.Single((await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None)).Equipment);
+
+        Assert.Equal(("FutureCombatSlot", "FutureLocation", "UnknownEquipmentReference"), (row.Slot, row.Location, row.ReferenceKind));
+    }
+
+    [Theory]
+    [InlineData("account")]
+    [InlineData("characters")]
+    [InlineData("builds")]
+    [InlineData("inventories")]
+    public async Task GetCharacterEquipmentAsync_requires_each_permission_before_roster_access(string missingPermission)
+    {
+        var permissions = new[] { "account", "characters", "builds", "inventories" }.Where(permission => permission != missingPermission);
+        var handler = new RecordingHandler("{\"permissions\":[" + string.Join(',', permissions.Select(permission => "\"" + permission + "\"")) + "]}");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Contains(missingPermission + " permission", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_retains_valid_partial_item_metadata_and_warns_only_for_omitted_ids()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[" + EquipmentRow("Helm", 1) + "," + EquipmentRow("Gloves", 2) + "]"), """{"equipment":[]}""", new ResponseSpec("""[{"id":1,"name":"Helm","type":"Armor","rarity":"Rare","level":0}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var equipment = await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal(("Helm", (string?)null), (equipment.Equipment[0].Item.Name, equipment.Equipment[1].Item.Name));
+        Assert.Equal(("items", "2"), Assert.Single(equipment.Warnings) is var warning ? (warning.Resolver, warning.ReferenceId) : default);
+        Assert.False(equipment.IsMetadataComplete);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidItemBatches))]
+    public async Task GetCharacterEquipmentAsync_discards_entire_invalid_item_batch(string itemBatch, HttpStatusCode status)
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[" + EquipmentRow("Helm", 1) + "]"), """{"equipment":[]}""", new ResponseSpec(itemBatch, status));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var equipment = await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Null(Assert.Single(equipment.Equipment).Item.Name);
+        Assert.Equal(("items", "1"), Assert.Single(equipment.Warnings) is var warning ? (warning.Resolver, warning.ReferenceId) : default);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/v2/itemstats?", StringComparison.Ordinal));
+    }
+
+    public static TheoryData<string, HttpStatusCode> InvalidItemBatches => new()
+    {
+        { "not-json", HttpStatusCode.OK },
+        { """[{"id":1,"name":"One","type":"Armor","rarity":"Rare","level":0},{"id":1,"name":"Duplicate","type":"Armor","rarity":"Rare","level":0}]""", HttpStatusCode.OK },
+        { """[{"id":2,"name":"Unrequested","type":"Armor","rarity":"Rare","level":0}]""", HttpStatusCode.OK },
+        { "[]", HttpStatusCode.OK },
+        { """[{"id":1,"name":"One","type":"Armor","rarity":"Rare","level":0}]""", HttpStatusCode.PartialContent }
+    };
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_consumes_upgrade_only_metadata_but_selected_stats_survive_invalid_primary_metadata()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster,
+            ActiveEquipment("[" + EquipmentRow("Helm", 1, ",\"upgrades\":[2],\"stats\":{\"id\":3,\"attributes\":{}}") + "]"),
+            """{"equipment":[]}""",
+            """[{"id":1,"name":"Primary missing required fields"},{"id":2,"name":"Upgrade only"}]""",
+            """[{"id":3,"name":"Selected Stat"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var equipment = await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        var row = Assert.Single(equipment.Equipment);
+        Assert.Null(row.Item.Name);
+        Assert.Null(Assert.Single(row.Upgrades).Name);
+        Assert.Equal((3L, "Selected Stat", "Selected"), (row.Stats!.Id, row.Stats.Name, row.Stats.Source));
+        Assert.Equal(["/v2/itemstats?ids=3&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris.Where(uri => uri.StartsWith("/v2/itemstats?", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_accepts_upgrade_only_item_metadata_without_primary_fields()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[" + EquipmentRow("Helm", 1, ",\"upgrades\":[2],\"infusions\":[2]") + "]"), """{"equipment":[]}""", """[{"id":1,"name":"Helm","type":"Armor","rarity":"Rare","level":0},{"id":2,"name":"Socket metadata only"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var row = Assert.Single((await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None)).Equipment);
+
+        Assert.Equal("Helm", row.Item.Name);
+        Assert.Equal(["Socket metadata only"], row.Upgrades.Select(reference => reference.Name));
+        Assert.Equal(["Socket metadata only"], row.Infusions.Select(reference => reference.Name));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_does_not_request_default_itemstat_after_invalid_primary_item_metadata()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, ActiveEquipment("[" + EquipmentRow("Helm", 1) + "]"), """{"equipment":[]}""", """[{"id":1,"name":"Missing primary fields"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/v2/itemstats?", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentAsync_propagates_caller_cancellation_and_stops_before_roster()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        var handler = new RecordingHandler(EquipmentPermissions) { OnRequest = cancellationSource.Cancel };
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EquipmentClient(httpClient).GetCharacterEquipmentAsync("Synthetic Hero", cancellationSource.Token));
+
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
     public async Task GetAccountAsync_missing_key_is_actionable_and_makes_no_request()
     {
         var handler = new RecordingHandler();
@@ -1757,6 +2054,12 @@ public sealed class Gw2ApiClientTests
         { new ResponseSpec("private active", HttpStatusCode.PartialContent) },
         { new ResponseSpec("private active", HttpStatusCode.InternalServerError) }
     };
+
+    private const string EquipmentPermissions = """{"permissions":["account","characters","builds","inventories"]}""";
+    private const string EquipmentRoster = """["Synthetic Hero"]""";
+    private static Gw2ApiClient EquipmentClient(HttpClient client) => new(client, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+    private static string ActiveEquipment(string equipment) => "{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":" + equipment + "}";
+    private static string EquipmentRow(string slot, int id, string extra = "") => "{\"slot\":\"" + slot + "\",\"id\":" + id + ",\"location\":\"Equipped\"" + extra + "}";
 
     private static string ActiveBuild(string profession, string? specializations = null, string? skills = null, string conditional = "", string outer = "", string buildExtra = "") =>
         "{\"tab\":1,\"is_active\":true" + outer
