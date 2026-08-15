@@ -451,6 +451,7 @@ public sealed class GetAccountHoldingsTests
         public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) => Complete("delivery", Delivery, DeliveryError);
         public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) => Complete("sells", CurrentSells, SellsError);
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) => Complete("items", Items, ItemsError);
+        public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
 
         private Task<T> Complete<T>(string call, T result, Exception? error)
         {

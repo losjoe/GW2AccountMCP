@@ -19,6 +19,7 @@ public interface IGw2ApiClient
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
     Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken);
     Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
+    Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
@@ -27,6 +28,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const string Language = "en";
     private const int CurrentSellsPageSize = 200;
     private const int MaximumItemBatchSize = 200;
+    private const int MaximumLegendaryArmoryRows = 256;
     private const int MaximumEquipmentRows = 32;
     private const int MaximumEquipmentReferences = 200;
     private const int MaximumEquipmentStatAttributes = 32;
@@ -578,6 +580,167 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2Items(
             itemIds.Where(itemsById.ContainsKey).Select(id => new Gw2Item(id, itemsById[id].Name!)).ToArray(),
             missingItemIds);
+    }
+
+    public async Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey))
+        {
+            throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        }
+
+        await ValidatePermissionsAsync(["account", "inventories", "unlocks"], cancellationToken);
+        using var response = await SendWithSingleRetryAsync("/v2/account/legendaryarmory", cancellationToken);
+        EnsureAuthenticatedOk(response, "Legendary Armory");
+        var ownership = await DeserializeLegendaryArmoryAsync(response, cancellationToken);
+        var metadata = await ResolveLegendaryArmoryItemsAsync(ownership.Select(entry => entry.Id).ToArray(), cancellationToken);
+        var warnings = ownership.Where(entry => !metadata.ContainsKey(entry.Id))
+            .Select(entry => new Gw2MetadataWarning("metadata_unresolved", "items", entry.Id.ToString(CultureInfo.InvariantCulture)))
+            .ToArray();
+        return new Gw2LegendaryArmory(
+            ownership.Select(entry => metadata.TryGetValue(entry.Id, out var item)
+                ? new Gw2LegendaryArmoryEntry(entry.Id, entry.Count, item.Name, item.Type, item.Subtype, item.WeightClass)
+                : new Gw2LegendaryArmoryEntry(entry.Id, entry.Count, null, null, null, null)).ToArray(),
+            warnings.Length == 0,
+            warnings);
+    }
+
+    private async Task<IReadOnlyList<LegendaryArmoryOwnership>> DeserializeLegendaryArmoryAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() > MaximumLegendaryArmoryRows)
+            {
+                throw InvalidLegendaryArmoryResponse();
+            }
+
+            var ownership = new List<LegendaryArmoryOwnership>();
+            var ids = new HashSet<long>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object) throw InvalidLegendaryArmoryResponse();
+                if (element.EnumerateObject().GroupBy(property => property.Name).Any(group => group.Count() > 1)) throw InvalidLegendaryArmoryResponse();
+                var id = LegendaryArmoryLong(element, "id");
+                var count = LegendaryArmoryLong(element, "count");
+                if (id <= 0 || count < 0 || !ids.Add(id)) throw InvalidLegendaryArmoryResponse();
+                ownership.Add(new LegendaryArmoryOwnership(id, count));
+            }
+
+            return ownership.OrderBy(entry => entry.Id).ToArray();
+        }
+        catch (JsonException)
+        {
+            throw InvalidLegendaryArmoryResponse();
+        }
+    }
+
+    private async Task<Dictionary<long, LegendaryArmoryItemMetadata>> ResolveLegendaryArmoryItemsAsync(IReadOnlyList<long> requestedIds, CancellationToken cancellationToken)
+    {
+        var resolved = new Dictionary<long, LegendaryArmoryItemMetadata>();
+        foreach (var chunk in requestedIds.Chunk(MaximumItemBatchSize))
+        {
+            try
+            {
+                using var response = await SendWithSingleRetryAsync(
+                    $"/v2/items?ids={Uri.EscapeDataString(string.Join(',', chunk))}",
+                    cancellationToken,
+                    authenticated: false);
+                if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) continue;
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+                if (document.RootElement.ValueKind != JsonValueKind.Array) continue;
+
+                var rows = new Dictionary<long, LegendaryArmoryItemMetadata>();
+                foreach (var element in document.RootElement.EnumerateArray())
+                {
+                    if (element.ValueKind != JsonValueKind.Object) throw InvalidLegendaryArmoryMetadataResponse();
+                    var id = LegendaryArmoryLong(element, "id");
+                    var name = LegendaryArmoryString(element, "name");
+                    var type = LegendaryArmoryString(element, "type");
+                    if (id <= 0 || !chunk.Contains(id) || !rows.TryAdd(id, ParseLegendaryArmoryItemMetadata(element, id, name, type)))
+                    {
+                        throw InvalidLegendaryArmoryMetadataResponse();
+                    }
+                }
+
+                if ((response.StatusCode == HttpStatusCode.OK && rows.Count != chunk.Length)
+                    || (response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || rows.Count == chunk.Length)))
+                {
+                    continue;
+                }
+
+                foreach (var row in rows) resolved.Add(row.Key, row.Value);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch
+            {
+            }
+        }
+
+        return resolved;
+    }
+
+    private static LegendaryArmoryItemMetadata ParseLegendaryArmoryItemMetadata(JsonElement item, long id, string name, string type)
+    {
+        string? subtype = null;
+        string? weightClass = null;
+        if (TryLegendaryArmoryProperty(item, "details", out var detailsValue))
+        {
+            if (detailsValue.ValueKind != JsonValueKind.Object) throw InvalidLegendaryArmoryMetadataResponse();
+            if (TryLegendaryArmoryProperty(detailsValue, "type", out var subtypeValue))
+            {
+                subtype = LegendaryArmoryStringValue(subtypeValue);
+            }
+
+            if (TryLegendaryArmoryProperty(detailsValue, "weight_class", out var weightClassValue))
+            {
+                var suppliedWeightClass = LegendaryArmoryStringValue(weightClassValue);
+                if (type == "Armor") weightClass = suppliedWeightClass;
+            }
+        }
+
+        return new LegendaryArmoryItemMetadata(id, name, type, subtype, weightClass);
+    }
+
+    private static long LegendaryArmoryLong(JsonElement objectElement, string name)
+    {
+        var value = LegendaryArmoryRequiredProperty(objectElement, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number)) throw InvalidLegendaryArmoryResponse();
+        return number;
+    }
+
+    private static string LegendaryArmoryString(JsonElement objectElement, string name) =>
+        LegendaryArmoryStringValue(LegendaryArmoryRequiredProperty(objectElement, name));
+
+    private static string LegendaryArmoryStringValue(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString())) throw InvalidLegendaryArmoryMetadataResponse();
+        return value.GetString()!;
+    }
+
+    private static JsonElement LegendaryArmoryRequiredProperty(JsonElement objectElement, string name)
+    {
+        var properties = objectElement.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        return properties.Length == 1 ? properties[0].Value : throw InvalidLegendaryArmoryResponse();
+    }
+
+    private static bool TryLegendaryArmoryProperty(JsonElement objectElement, string name, out JsonElement value)
+    {
+        var properties = objectElement.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (properties.Length > 1) throw InvalidLegendaryArmoryMetadataResponse();
+        if (properties.Length == 0)
+        {
+            value = default;
+            return false;
+        }
+
+        value = properties[0].Value;
+        return true;
     }
 
     private async Task ValidatePermissionsAsync(IReadOnlyList<string> requiredPermissions, CancellationToken cancellationToken)
@@ -1731,6 +1894,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidCurrentSellsResponse() => new("GW2 returned an invalid current-sells response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
     private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
+    private static Gw2ConfigurationException InvalidLegendaryArmoryResponse() => new("GW2 returned an invalid Legendary Armory response. Try again later.");
+    private static Gw2ConfigurationException InvalidLegendaryArmoryMetadataResponse() => new("GW2 returned invalid Legendary Armory item metadata. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
@@ -1775,6 +1940,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         DateTimeOffset? Created);
     private sealed record CurrentSellsPagination(long PageSize, int PageTotal, long ResultCount, long ResultTotal);
     private sealed record ItemResponse(long? Id, string? Name);
+    private sealed record LegendaryArmoryOwnership(long Id, long Count);
+    private sealed record LegendaryArmoryItemMetadata(long Id, string Name, string Type, string? Subtype, string? WeightClass);
     private sealed record ActiveEquipmentPayload(int Tab, string Name, IReadOnlyList<AuthenticatedEquipmentRow> Rows);
     private sealed record AuthenticatedEquipmentRow(string Slot, long ItemId, long? SkinId, IReadOnlyList<long> Upgrades, IReadOnlyList<long> Infusions, string? Binding, string? BoundTo, string Location, string ReferenceKind, long? SelectedStatId, IReadOnlyList<Gw2EquipmentStatAttribute>? SelectedAttributes);
     private sealed record EquipmentItemBatch(IReadOnlyDictionary<long, EquipmentItemMetadata> Rows);
@@ -1888,6 +2055,8 @@ public sealed record Gw2CurrentSells(IReadOnlyList<Gw2CurrentSellOrder> Orders);
 public sealed record Gw2CurrentSellOrder(long Id, long ItemId, long Price, long Quantity, DateTimeOffset Created);
 public sealed record Gw2Items(IReadOnlyList<Gw2Item> Items, IReadOnlyList<long> MissingItemIds);
 public sealed record Gw2Item(long Id, string Name);
+public sealed record Gw2LegendaryArmory(IReadOnlyList<Gw2LegendaryArmoryEntry> Entries, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
+public sealed record Gw2LegendaryArmoryEntry(long Id, long ArmoryCount, string? Name, string? Type, string? Subtype, string? WeightClass);
 public sealed record Gw2CharacterBuild(
     string CharacterName,
     int Tab,

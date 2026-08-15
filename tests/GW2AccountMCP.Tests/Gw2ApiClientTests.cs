@@ -1720,6 +1720,258 @@ public sealed class Gw2ApiClientTests
     }
 
     [Fact]
+    public async Task GetLegendaryArmoryAsync_requires_a_configured_key_before_any_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => LegendaryArmoryClient(httpClient, string.Empty).GetLegendaryArmoryAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("account")]
+    [InlineData("inventories")]
+    [InlineData("unlocks")]
+    public async Task GetLegendaryArmoryAsync_requires_each_operation_permission_before_ownership_access(string missingPermission)
+    {
+        var permissions = new[] { "account", "inventories", "unlocks" }.Where(permission => permission != missingPermission);
+        var handler = new RecordingHandler("{\"permissions\":[" + string.Join(',', permissions.Select(permission => "\"" + permission + "\"")) + "]}");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None));
+
+        Assert.Contains(missingPermission + " permission", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetLegendaryArmoryAsync_returns_sorted_ownership_preserves_signed_64_bit_counts_and_resolves_compact_metadata()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","inventories","unlocks"]}""",
+            """[{"id":2,"count":0,"future":true},{"id":1,"count":9223372036854775807}]""",
+            """[{"id":1,"name":"Synthetic One","type":"FutureType","details":{"type":"FutureSubtype","weight_class":"FutureWeight"}},{"id":2,"name":"Synthetic Two","type":"Armor","details":{"weight_class":"FutureArmorWeight"}}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var armory = await LegendaryArmoryClient(httpClient, apiKey).GetLegendaryArmoryAsync(CancellationToken.None);
+
+        Assert.Equal(
+            [(1L, long.MaxValue, "Synthetic One", "FutureType", "FutureSubtype", (string?)null), (2L, 0L, "Synthetic Two", "Armor", (string?)null, "FutureArmorWeight")],
+            armory.Entries.Select(entry => (entry.Id, entry.ArmoryCount, entry.Name, entry.Type, entry.Subtype, entry.WeightClass)));
+        Assert.True(armory.IsMetadataComplete);
+        Assert.Empty(armory.Warnings);
+        Assert.Equal(
+            ["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/account/legendaryarmory?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/items?ids=1%2C2&lang=en&v=2025-08-29T01%3A00%3A00.000Z"],
+            handler.RequestUris);
+        Assert.Equal(["Bearer " + apiKey, "Bearer " + apiKey, null], handler.AuthorizationHeaders);
+    }
+
+    [Fact]
+    public async Task GetLegendaryArmoryAsync_accepts_empty_ownership_without_a_public_request()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","inventories","unlocks"]}""", "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var armory = await LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None);
+
+        Assert.Empty(armory.Entries);
+        Assert.True(armory.IsMetadataComplete);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task GetLegendaryArmoryAsync_maps_authenticated_authorization_failure_to_invalid_key(HttpStatusCode statusCode)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler("""{"permissions":["account","inventories","unlocks"]}""", new ResponseSpec("private ownership", statusCode));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => LegendaryArmoryClient(httpClient, apiKey).GetLegendaryArmoryAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.PartialContent)]
+    [InlineData(HttpStatusCode.BadRequest)]
+    public async Task GetLegendaryArmoryAsync_rejects_non_200_ownership_without_metadata(HttpStatusCode statusCode)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","inventories","unlocks"]}""", new ResponseSpec("private ownership", statusCode));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None));
+
+        Assert.Contains($"HTTP {(int)statusCode}", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private ownership", error.Message, StringComparison.Ordinal);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidLegendaryArmoryOwnershipResponses))]
+    public async Task GetLegendaryArmoryAsync_rejects_invalid_or_duplicate_ownership_before_metadata(string ownershipResponse)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","inventories","unlocks"]}""", ownershipResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None));
+
+        Assert.Contains("Legendary Armory response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(ownershipResponse, error.Message, StringComparison.Ordinal);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<string> InvalidLegendaryArmoryOwnershipResponses => new()
+    {
+        "{malformed", "{}", "null", "[null]", "[{}]", "[{\"id\":1}]", "[{\"count\":1}]",
+        "[{\"id\":1,\"id\":2,\"count\":1}]", "[{\"id\":1,\"count\":1,\"count\":2}]",
+        "[{\"id\":1,\"count\":1,\"future\":true,\"future\":false}]",
+        "[{\"id\":0,\"count\":1}]", "[{\"id\":-1,\"count\":1}]", "[{\"id\":1.5,\"count\":1}]", "[{\"id\":9223372036854775808,\"count\":1}]",
+        "[{\"id\":1,\"count\":-1}]", "[{\"id\":1,\"count\":1.5}]", "[{\"id\":1,\"count\":9223372036854775808}]",
+        "[{\"id\":1,\"count\":1},{\"id\":1,\"count\":0}]", "[{\"id\":\"1\",\"count\":1}]"
+    };
+
+    [Fact]
+    public async Task GetLegendaryArmoryAsync_accepts_256_rows_in_two_sequential_batches_and_rejects_257_before_metadata()
+    {
+        var acceptedHandler = new RecordingHandler(
+            """{"permissions":["account","inventories","unlocks"]}""",
+            LegendaryOwnership(Enumerable.Range(1, 256).Select(id => (long)id)),
+            LegendaryMetadata(Enumerable.Range(1, 200).Select(id => (long)id)),
+            LegendaryMetadata(Enumerable.Range(201, 56).Select(id => (long)id)));
+        using var acceptedHttpClient = new HttpClient(acceptedHandler) { BaseAddress = new Uri("https://example.test") };
+
+        var accepted = await LegendaryArmoryClient(acceptedHttpClient).GetLegendaryArmoryAsync(CancellationToken.None);
+
+        Assert.Equal(256, accepted.Entries.Count);
+        Assert.True(accepted.IsMetadataComplete);
+        Assert.Equal(4, acceptedHandler.RequestUris.Count);
+        Assert.Contains("ids=1%2C2", acceptedHandler.RequestUris[2], StringComparison.Ordinal);
+        Assert.Contains("ids=201%2C202", acceptedHandler.RequestUris[3], StringComparison.Ordinal);
+
+        var rejectedHandler = new RecordingHandler("""{"permissions":["account","inventories","unlocks"]}""", LegendaryOwnership(Enumerable.Range(1, 257).Select(id => (long)id)));
+        using var rejectedHttpClient = new HttpClient(rejectedHandler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => LegendaryArmoryClient(rejectedHttpClient).GetLegendaryArmoryAsync(CancellationToken.None));
+
+        Assert.Equal(2, rejectedHandler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetLegendaryArmoryAsync_retains_a_valid_206_metadata_subset_with_ordered_warning()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","inventories","unlocks"]}""",
+            LegendaryOwnership([1, 2]),
+            new ResponseSpec("""[{"id":1,"name":"Synthetic One","type":"Weapon"}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var armory = await LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None);
+
+        Assert.Equal("Synthetic One", armory.Entries[0].Name);
+        Assert.Null(armory.Entries[1].Name);
+        Assert.False(armory.IsMetadataComplete);
+        Assert.Equal([("metadata_unresolved", "items", "2")], armory.Warnings.Select(warning => (warning.Code, warning.Resolver, warning.ReferenceId)));
+    }
+
+    [Fact]
+    public async Task GetLegendaryArmoryAsync_degrades_public_status_transport_and_noncaller_timeout_metadata_failures()
+    {
+        foreach (var publicFailure in new object[]
+        {
+            new ResponseSpec("private metadata", HttpStatusCode.NotFound),
+            new ResponseSpec("private metadata", HttpStatusCode.InternalServerError),
+            new HttpRequestException("private transport"),
+            new OperationCanceledException("private timeout")
+        })
+        {
+            var handler = new RecordingHandler("""{"permissions":["account","inventories","unlocks"]}""", LegendaryOwnership([1]), publicFailure);
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+            var armory = await LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None);
+
+            Assert.Null(Assert.Single(armory.Entries).Name);
+            Assert.False(armory.IsMetadataComplete);
+            Assert.Equal("1", Assert.Single(armory.Warnings).ReferenceId);
+        }
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidLegendaryArmoryMetadataBatches))]
+    public async Task GetLegendaryArmoryAsync_discards_only_invalid_metadata_batches(string metadataResponse, HttpStatusCode statusCode)
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","inventories","unlocks"]}""",
+            LegendaryOwnership([1, 2]),
+            new ResponseSpec(metadataResponse, statusCode));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var armory = await LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None);
+
+        Assert.All(armory.Entries, entry => Assert.Equal((string?)null, entry.Name));
+        Assert.Equal(["1", "2"], armory.Warnings.Select(warning => warning.ReferenceId));
+    }
+
+    public static TheoryData<string, HttpStatusCode> InvalidLegendaryArmoryMetadataBatches => new()
+    {
+        { "{malformed", HttpStatusCode.OK }, { "{}", HttpStatusCode.OK }, { "[{}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"Weapon\"},{\"id\":1,\"name\":\"Duplicate\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":3,\"name\":\"Unrequested\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"\",\"type\":\"Weapon\"},{\"id\":2,\"name\":\"Two\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"\"},{\"id\":2,\"name\":\"Two\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"Weapon\",\"details\":[]},{\"id\":2,\"name\":\"Two\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"Weapon\",\"details\":{\"type\":\" \"}},{\"id\":2,\"name\":\"Two\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"Weapon\",\"details\":{\"weight_class\":1}},{\"id\":2,\"name\":\"Two\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"Weapon\"}]", HttpStatusCode.OK },
+        { "[{\"id\":1,\"name\":\"One\",\"type\":\"Weapon\"},{\"id\":2,\"name\":\"Two\",\"type\":\"Weapon\"}]", HttpStatusCode.PartialContent },
+        { "[]", HttpStatusCode.PartialContent }
+    };
+
+    [Fact]
+    public async Task GetLegendaryArmoryAsync_continues_after_a_failed_first_metadata_batch_and_propagates_caller_cancellation_before_later_batches()
+    {
+        var ids = Enumerable.Range(1, 256).Select(id => (long)id).ToArray();
+        var handler = new RecordingHandler(
+            """{"permissions":["account","inventories","unlocks"]}""",
+            LegendaryOwnership(ids),
+            new ResponseSpec("private first batch", HttpStatusCode.NotFound),
+            LegendaryMetadata(ids.Skip(200)));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var armory = await LegendaryArmoryClient(httpClient).GetLegendaryArmoryAsync(CancellationToken.None);
+
+        Assert.Null(armory.Entries[0].Name);
+        Assert.Equal("Synthetic 201", armory.Entries[200].Name);
+        Assert.Equal(200, armory.Warnings.Count);
+
+        using var cancellationSource = new CancellationTokenSource();
+        RecordingHandler? cancellationHandler = null;
+        cancellationHandler = new RecordingHandler(
+            """{"permissions":["account","inventories","unlocks"]}""",
+            LegendaryOwnership(ids),
+            LegendaryMetadata(ids.Take(200)),
+            LegendaryMetadata(ids.Skip(200)))
+        {
+            OnRequest = () =>
+            {
+                if (cancellationHandler!.RequestUris.Count == 3) cancellationSource.Cancel();
+            }
+        };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler!) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => LegendaryArmoryClient(cancellationHttpClient).GetLegendaryArmoryAsync(cancellationSource.Token));
+
+        Assert.Equal(3, cancellationHandler!.RequestUris.Count);
+    }
+
+    [Fact]
     public async Task GetItemsAsync_requests_only_caller_ids_in_order_without_authentication()
     {
         var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item"},{"id":1,"name":"First Item"}]"""));
@@ -2377,6 +2629,15 @@ public sealed class Gw2ApiClientTests
         : "{\"id\":" + id + ",\"name\":\"Bag " + id + "\"}")) + "]";
     private static Gw2ApiClient EquipmentClient(HttpClient client) => new(client, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
     private static string ActiveEquipment(string equipment) => "{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":" + equipment + "}";
+    private static Gw2ApiClient LegendaryArmoryClient(HttpClient httpClient, string? apiKey = null) =>
+        new(httpClient, new Gw2ApiOptions(apiKey ?? new string('k', 16), "https://example.test"));
+
+    private static string LegendaryOwnership(IEnumerable<long> ids) =>
+        "[" + string.Join(',', ids.Select(id => "{\"id\":" + id + ",\"count\":1}")) + "]";
+
+    private static string LegendaryMetadata(IEnumerable<long> ids) =>
+        "[" + string.Join(',', ids.Select(id => "{\"id\":" + id + ",\"name\":\"Synthetic " + id + "\",\"type\":\"Weapon\"}")) + "]";
+
     private static string EquipmentRow(string slot, int id, string extra = "") => "{\"slot\":\"" + slot + "\",\"id\":" + id + ",\"location\":\"Equipped\"" + extra + "}";
 
     private static string ActiveBuild(string profession, string? specializations = null, string? skills = null, string conditional = "", string outer = "", string buildExtra = "") =>

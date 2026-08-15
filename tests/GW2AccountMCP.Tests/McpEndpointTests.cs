@@ -17,7 +17,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_eight_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_nine_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -27,7 +27,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_legendary_armory", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -77,6 +77,17 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.True(holdingsOutputSchema.TryGetProperty("asOf", out _));
         Assert.DoesNotContain("key", holdingsOutputSchema.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", holdingsOutputSchema.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        var legendaryArmory = toolsByName["get_legendary_armory"];
+        Assert.Empty(legendaryArmory.GetProperty("inputSchema").GetProperty("properties").EnumerateObject());
+        var legendaryArmoryOutput = legendaryArmory.GetProperty("outputSchema");
+        Assert.Equal(["ownershipScope", "countSemantics", "entries", "isMetadataComplete", "warnings", "asOf"], legendaryArmoryOutput.GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["ownershipScope", "countSemantics", "entries", "isMetadataComplete", "warnings", "asOf"], legendaryArmoryOutput.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        AssertSchemaRequired(legendaryArmoryOutput.GetProperty("properties").GetProperty("entries").GetProperty("items"), "id", "name", "type", "subtype", "weightClass", "armoryCount");
+        AssertSchemaRequired(legendaryArmoryOutput.GetProperty("properties").GetProperty("warnings").GetProperty("items"), "code", "resolver", "referenceId");
+        Assert.Contains("account Legendary Armory ownership", legendaryArmory.GetProperty("description").GetString(), StringComparison.Ordinal);
+        Assert.Contains("one equipment template", legendaryArmory.GetProperty("description").GetString(), StringComparison.Ordinal);
+        Assert.Contains("not physical holdings", legendaryArmory.GetProperty("description").GetString(), StringComparison.Ordinal);
+        Assert.Contains("must not be added to get_account_holdings", legendaryArmory.GetProperty("description").GetString(), StringComparison.Ordinal);
         var walletOutputSchema = toolsByName["get_wallet"].GetProperty("outputSchema").GetProperty("properties");
         Assert.True(walletOutputSchema.TryGetProperty("balances", out _));
         Assert.True(walletOutputSchema.TryGetProperty("warnings", out _));
@@ -417,6 +428,32 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     }
 
     [Fact]
+    public async Task GetLegendaryArmory_returns_no_argument_structured_account_ownership_with_explicit_nulls()
+    {
+        await InitializeAsync();
+
+        using var response = await PostMcpAsync(16, "tools/call", new { name = "get_legendary_armory", arguments = new { } });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal("AccountLegendaryArmory", structured.GetProperty("ownershipScope").GetString());
+        Assert.Equal("AvailableForUseInSingleEquipmentTemplate", structured.GetProperty("countSemantics").GetString());
+        var entry = Assert.Single(structured.GetProperty("entries").EnumerateArray());
+        Assert.Equal(101, entry.GetProperty("id").GetInt64());
+        Assert.Equal(0, entry.GetProperty("armoryCount").GetInt64());
+        Assert.Equal(JsonValueKind.Null, entry.GetProperty("name").ValueKind);
+        Assert.Equal(JsonValueKind.Null, entry.GetProperty("type").ValueKind);
+        Assert.Equal(JsonValueKind.Null, entry.GetProperty("subtype").ValueKind);
+        Assert.Equal(JsonValueKind.Null, entry.GetProperty("weightClass").ValueKind);
+        Assert.False(structured.GetProperty("isMetadataComplete").GetBoolean());
+        Assert.Equal(("metadata_unresolved", "items", "101"), Assert.Single(structured.GetProperty("warnings").EnumerateArray()) is var warning
+            ? (warning.GetProperty("code").GetString(), warning.GetProperty("resolver").GetString(), warning.GetProperty("referenceId").GetString())
+            : default);
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
+    }
+
+    [Fact]
     public async Task Mcp_route_rejects_non_mcp_get_requests()
     {
         using var response = await client.GetAsync("/mcp");
@@ -564,6 +601,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Items([new Gw2Item(101, "Synthetic Item")], []));
 
+        public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2LegendaryArmory([new Gw2LegendaryArmoryEntry(101, 0, null, null, null, null)], false, [new Gw2MetadataWarning("metadata_unresolved", "items", "101")]));
+
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -600,6 +640,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2 item metadata request failed with HTTP 503. Try again later.");
 
+        public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required unlocks permission. Create a key with the unlocks permission.");
+
     }
 
     private sealed class NullableHoldingsGw2ApiClient : IGw2ApiClient
@@ -631,6 +674,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("Synthetic metadata failure.");
+
+        public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
 
     }
 

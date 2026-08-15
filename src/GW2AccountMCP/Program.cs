@@ -34,6 +34,7 @@ builder.Services
     .WithTools<FindItemsTool>()
     .WithTools<GetAccountTool>()
     .WithTools<GetAccountHoldingsTool>()
+    .WithTools<GetLegendaryArmoryTool>()
     .WithTools<GetCharacterBuildTool>()
     .WithTools<GetCharacterEquipmentTool>()
     .WithTools<GetCharacterInventoryTool>()
