@@ -2,6 +2,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using GW2AccountMCP.Gw2;
+using GW2AccountMCP.Items;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -16,7 +17,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_three_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_four_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -26,7 +27,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["get_account", "get_account_holdings", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -36,13 +37,37 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             Assert.True(tool.TryGetProperty("outputSchema", out _));
         }
 
-        var accountOutputSchema = discoveredTools[0].GetProperty("outputSchema").GetProperty("properties");
+        var toolsByName = discoveredTools.ToDictionary(tool => tool.GetProperty("name").GetString()!);
+        var findItems = toolsByName["find_items"];
+        var findItemsInputSchema = findItems.GetProperty("inputSchema");
+        var findItemsInputProperties = findItemsInputSchema.GetProperty("properties");
+        Assert.True(findItemsInputProperties.TryGetProperty("query", out _));
+        Assert.True(findItemsInputProperties.TryGetProperty("limit", out _));
+        Assert.Contains("query", findItemsInputSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var findItemsOutputSchema = findItems.GetProperty("outputSchema");
+        var findItemsOutputProperties = findItemsOutputSchema.GetProperty("properties");
+        Assert.True(findItemsOutputProperties.TryGetProperty("normalizedQuery", out _));
+        Assert.True(findItemsOutputProperties.TryGetProperty("candidates", out var candidatesSchema));
+        Assert.True(findItemsOutputProperties.TryGetProperty("hasMore", out _));
+        var candidateProperties = candidatesSchema.GetProperty("items").GetProperty("properties");
+        Assert.Equal("integer", candidateProperties.GetProperty("id").GetProperty("type").GetString());
+        Assert.Equal("string", candidateProperties.GetProperty("name").GetProperty("type").GetString());
+        Assert.Equal("string", candidateProperties.GetProperty("type").GetProperty("type").GetString());
+        Assert.Equal("string", candidateProperties.GetProperty("rarity").GetProperty("type").GetString());
+        Assert.Equal("integer", candidateProperties.GetProperty("level").GetProperty("type").GetString());
+        Assert.Equal("string", candidateProperties.GetProperty("matchKind").GetProperty("type").GetString());
+        var candidateRequired = candidatesSchema.GetProperty("items").GetProperty("required").EnumerateArray().Select(value => value.GetString());
+        Assert.Equal(["id", "name", "type", "rarity", "level", "matchKind"], candidateRequired);
+        Assert.DoesNotContain("key", findItems.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", findItems.GetRawText(), StringComparison.OrdinalIgnoreCase);
+
+        var accountOutputSchema = toolsByName["get_account"].GetProperty("outputSchema").GetProperty("properties");
         Assert.True(accountOutputSchema.TryGetProperty("name", out _));
         Assert.True(accountOutputSchema.TryGetProperty("asOf", out _));
-        var holdingsInputSchema = discoveredTools[1].GetProperty("inputSchema").GetProperty("properties");
+        var holdingsInputSchema = toolsByName["get_account_holdings"].GetProperty("inputSchema").GetProperty("properties");
         Assert.True(holdingsInputSchema.TryGetProperty("itemIds", out _));
         Assert.True(holdingsInputSchema.TryGetProperty("currencyIds", out _));
-        var holdingsOutputSchema = discoveredTools[1].GetProperty("outputSchema").GetProperty("properties");
+        var holdingsOutputSchema = toolsByName["get_account_holdings"].GetProperty("outputSchema").GetProperty("properties");
         Assert.True(holdingsOutputSchema.TryGetProperty("items", out _));
         Assert.True(holdingsOutputSchema.TryGetProperty("currencies", out _));
         Assert.True(holdingsOutputSchema.TryGetProperty("isComplete", out _));
@@ -52,11 +77,66 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.True(holdingsOutputSchema.TryGetProperty("asOf", out _));
         Assert.DoesNotContain("key", holdingsOutputSchema.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", holdingsOutputSchema.GetRawText(), StringComparison.OrdinalIgnoreCase);
-        var walletOutputSchema = discoveredTools[2].GetProperty("outputSchema").GetProperty("properties");
+        var walletOutputSchema = toolsByName["get_wallet"].GetProperty("outputSchema").GetProperty("properties");
         Assert.True(walletOutputSchema.TryGetProperty("balances", out _));
         Assert.True(walletOutputSchema.TryGetProperty("warnings", out _));
         Assert.True(walletOutputSchema.TryGetProperty("asOf", out _));
         Assert.DoesNotContain("GW2_API_KEY", document.RootElement.GetRawText(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task FindItems_returns_structured_candidates_without_private_configuration()
+    {
+        await InitializeAsync();
+
+        using var response = await PostMcpAsync(9, "tools/call", new
+        {
+            name = "find_items",
+            arguments = new { query = "  Beta\tBlade ", limit = 1 }
+        });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+        using var document = JsonDocument.Parse(payload);
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal("Beta Blade", structured.GetProperty("normalizedQuery").GetString());
+        var candidate = Assert.Single(structured.GetProperty("candidates").EnumerateArray());
+        Assert.Equal(123, candidate.GetProperty("id").GetInt64());
+        Assert.Equal("Beta Blade", candidate.GetProperty("name").GetString());
+        Assert.Equal("Weapon", candidate.GetProperty("type").GetString());
+        Assert.Equal("Rare", candidate.GetProperty("rarity").GetString());
+        Assert.Equal(80, candidate.GetProperty("level").GetInt32());
+        Assert.Equal(JsonValueKind.String, candidate.GetProperty("matchKind").ValueKind);
+        Assert.Equal("Exact", candidate.GetProperty("matchKind").GetString());
+        Assert.False(structured.GetProperty("hasMore").GetBoolean());
+        Assert.False(document.RootElement.GetProperty("result").TryGetProperty("isError", out var isError) && isError.GetBoolean());
+        Assert.DoesNotContain("key", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", payload, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task FindItems_does_not_call_a_configured_throwing_api_client()
+    {
+        using var errorFactory = new ErrorMcpApplicationFactory();
+        using var errorClient = errorFactory.CreateClient();
+        await InitializeAsync(errorClient);
+
+        using var response = await PostMcpAsync(errorClient, 10, "tools/call", new { name = "find_items", arguments = new { query = "Beta" } });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+
+        using var document = JsonDocument.Parse(payload);
+        var candidate = Assert.Single(document.RootElement.GetProperty("result").GetProperty("structuredContent").GetProperty("candidates").EnumerateArray());
+        Assert.Equal(123, candidate.GetProperty("id").GetInt64());
+        Assert.False(document.RootElement.GetProperty("result").TryGetProperty("isError", out var isError) && isError.GetBoolean());
+        Assert.DoesNotContain("private catalog configuration detail", payload, StringComparison.Ordinal);
+
+        using var noMatchResponse = await PostMcpAsync(errorClient, 11, "tools/call", new { name = "find_items", arguments = new { query = "Missing" } });
+        noMatchResponse.EnsureSuccessStatusCode();
+        using var noMatchDocument = JsonDocument.Parse(await ReadMcpResponseAsync(noMatchResponse));
+        var noMatch = noMatchDocument.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Empty(noMatch.GetProperty("candidates").EnumerateArray());
+        Assert.False(noMatchDocument.RootElement.GetProperty("result").TryGetProperty("isError", out var noMatchError) && noMatchError.GetBoolean());
     }
 
     [Fact]
@@ -247,10 +327,13 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     {
         protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
         {
+            builder.UseSetting("GW2_API_BUDGET_LOCK_PATH", CreateTestLockPath());
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<IGw2ApiClient>();
                 services.AddSingleton<IGw2ApiClient>(new FakeGw2ApiClient());
+                services.RemoveAll<IItemCacheReader>();
+                services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
                 services.RemoveAll<TimeProvider>();
                 services.AddSingleton<TimeProvider>(new FixedTimeProvider());
             });
@@ -261,10 +344,13 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     {
         protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
         {
+            builder.UseSetting("GW2_API_BUDGET_LOCK_PATH", CreateTestLockPath());
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<IGw2ApiClient>();
                 services.AddSingleton<IGw2ApiClient>(new ErrorGw2ApiClient());
+                services.RemoveAll<IItemCacheReader>();
+                services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
             });
         }
     }
@@ -273,13 +359,22 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     {
         protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
         {
+            builder.UseSetting("GW2_API_BUDGET_LOCK_PATH", CreateTestLockPath());
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<IGw2ApiClient>();
                 services.AddSingleton<IGw2ApiClient>(new NullableHoldingsGw2ApiClient());
+                services.RemoveAll<IItemCacheReader>();
+                services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
             });
         }
     }
+
+    private static string CreateTestLockPath() => Path.Combine(
+        Path.GetTempPath(),
+        "GW2AccountMCP.Tests",
+        Guid.NewGuid().ToString("N"),
+        "gw2-api-budget.lock");
 
     private sealed class FakeGw2ApiClient : IGw2ApiClient
     {
@@ -303,6 +398,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Items([new Gw2Item(101, "Synthetic Item")], []));
+
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -327,6 +423,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2 item metadata request failed with HTTP 503. Try again later.");
+
     }
 
     private sealed class NullableHoldingsGw2ApiClient : IGw2ApiClient
@@ -351,6 +448,20 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("Synthetic metadata failure.");
+
+    }
+
+    private sealed class FakeCacheReader : IItemCacheReader
+    {
+        private static readonly ItemCacheSnapshot Snapshot = new(
+            [new CachedItem(123, "Beta Blade", "Weapon", "Rare", 80)],
+            new ItemCacheFingerprint(
+                new ItemCachePathFingerprint("items.manifest.json", new DateTime(2026, 8, 12, 0, 0, 0, DateTimeKind.Utc), 1),
+                new ItemCachePathFingerprint("items.csv", new DateTime(2026, 8, 12, 0, 0, 0, DateTimeKind.Utc), 1)),
+            new DateTime(2026, 8, 12, 0, 0, 0, DateTimeKind.Utc));
+
+        public ItemCacheFingerprint GetCurrentFingerprint() => Snapshot.Fingerprint;
+        public ItemCacheSnapshot Load(CancellationToken cancellationToken) => Snapshot;
     }
 
     private sealed class FixedTimeProvider : TimeProvider

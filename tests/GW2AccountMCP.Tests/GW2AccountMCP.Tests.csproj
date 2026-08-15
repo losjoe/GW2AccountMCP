@@ -16,5 +16,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\GW2AccountMCP\GW2AccountMCP.csproj" />
+    <ProjectReference Include="..\..\tools\GW2AccountMCP.DataRefresh\GW2AccountMCP.DataRefresh.csproj" />
   </ItemGroup>
 </Project>

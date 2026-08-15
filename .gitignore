@@ -44,3 +44,9 @@ visualizer
 # Local configuration that may contain secrets
 appsettings.Development.json
 launchSettings.local.json
+
+# Local Excel public-data snapshots and lock files
+/data/*.xlsx
+/data/*.lock
+/data/public-cache/
+/data/public-cache-test/
