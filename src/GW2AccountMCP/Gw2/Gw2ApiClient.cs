@@ -13,6 +13,7 @@ public interface IGw2ApiClient
     Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken);
+    Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
@@ -281,6 +282,55 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2CharacterEquipment(canonicalCharacterName, payload.Tab, payload.Name,
             rows.Select(row => ToEquipmentRow(row, itemMetadata.Rows, itemStats.Rows, skins.Rows)).ToArray(),
             warnings.Count == 0, warnings);
+    }
+
+    public async Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey)) throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        if (string.IsNullOrWhiteSpace(characterName)) throw new Gw2ConfigurationException("characterName is required and must not be blank.");
+        await ValidatePermissionsAsync(["account", "characters", "inventories"], cancellationToken);
+        using var rosterResponse = await SendWithSingleRetryAsync("/v2/characters", cancellationToken);
+        EnsureAuthenticatedOk(rosterResponse, "character-list");
+        var canonicalName = (await DeserializeCharacterNamesAsync(rosterResponse, cancellationToken)).SingleOrDefault(name => string.Equals(name, characterName, StringComparison.Ordinal));
+        if (canonicalName is null) throw new Gw2ConfigurationException("The requested character was not found in the authenticated roster.");
+        using var response = await SendWithSingleRetryAsync($"/v2/characters/{Uri.EscapeDataString(canonicalName)}/inventory", cancellationToken);
+        EnsureAuthenticatedOk(response, "character-inventory");
+        var payload = await DeserializeSelectedCharacterInventoryAsync(response, cancellationToken);
+        var stacks = payload.Bags.Where(bag => bag is not null).SelectMany(bag => bag!.Slots).Where(stack => stack is not null).Select(stack => stack!).ToArray();
+        var itemIds = payload.Bags.Where(bag => bag is not null).Select(bag => bag!.Id).Concat(stacks.SelectMany(stack => new[] { stack.ItemId }.Concat(stack.Upgrades).Concat(stack.Infusions))).Distinct().Order().ToArray();
+        var items = await ResolveInventoryItemsAsync(itemIds, stacks.Select(stack => stack.ItemId).ToHashSet(), cancellationToken);
+        var statIds = stacks.Select(stack => stack.SelectedStatId ?? items.GetValueOrDefault(stack.ItemId)?.DefaultStatId).Where(id => id is not null).Select(id => id!.Value).Distinct().Order().ToArray();
+        var stats = await ResolveInventoryNamesAsync("itemstats", statIds, cancellationToken);
+        var skinIds = stacks.Where(stack => stack.SkinId is not null).Select(stack => stack.SkinId!.Value).Distinct().Order().ToArray();
+        var skins = await ResolveInventoryNamesAsync("skins", skinIds, cancellationToken);
+        var warnings = new List<Gw2MetadataWarning>();
+        AddEquipmentWarnings(warnings, "items", itemIds, items.Keys);
+        AddEquipmentWarnings(warnings, "itemstats", statIds, stats.Keys);
+        AddEquipmentWarnings(warnings, "skins", skinIds, skins.Keys);
+        var bags = new List<Gw2CharacterInventoryBag>();
+        var equipped = 0;
+        var slotsTotal = 0;
+        var occupied = 0;
+        for (var bagPosition = 0; bagPosition < payload.Bags.Count; bagPosition++)
+        {
+            var bag = payload.Bags[bagPosition];
+            if (bag is null) { bags.Add(new Gw2CharacterInventoryBag(bagPosition, null, [])); continue; }
+            equipped++;
+            slotsTotal += bag.Size;
+            var slots = new List<Gw2CharacterInventorySlot>();
+            for (var slotPosition = 0; slotPosition < bag.Slots.Count; slotPosition++)
+            {
+                var stack = bag.Slots[slotPosition];
+                if (stack is null) { slots.Add(new Gw2CharacterInventorySlot(slotPosition, null)); continue; }
+                occupied++;
+                var metadata = items.GetValueOrDefault(stack.ItemId);
+                var statId = stack.SelectedStatId ?? metadata?.DefaultStatId;
+                var stat = statId is null ? null : new Gw2InventoryStat(statId.Value, stats.GetValueOrDefault(statId.Value), stack.SelectedStatId is null ? "ItemDefault" : "Selected", stack.SelectedStatId is null ? null : stack.SelectedAttributes);
+                slots.Add(new Gw2CharacterInventorySlot(slotPosition, new Gw2InventoryStack(new Gw2InventoryItem(stack.ItemId, metadata?.Name, metadata?.Type, metadata?.Subtype, metadata?.Rarity, metadata?.Level), stack.Count, stack.Charges, stat, stack.Upgrades.Select(id => new Gw2InventoryReference(id, items.GetValueOrDefault(id)?.Name)).ToArray(), stack.Infusions.Select(id => new Gw2InventoryReference(id, items.GetValueOrDefault(id)?.Name)).ToArray(), stack.SkinId is { } skinId ? new Gw2InventoryReference(skinId, skins.GetValueOrDefault(skinId)) : null, stack.Binding, stack.BoundTo)));
+            }
+            bags.Add(new Gw2CharacterInventoryBag(bagPosition, new Gw2InventoryBag(bag.Id, items.GetValueOrDefault(bag.Id)?.Name, bag.Size), slots));
+        }
+        return new Gw2CharacterInventory(canonicalName, new Gw2CharacterInventoryCapacity(payload.Bags.Count, equipped, slotsTotal, occupied, slotsTotal - occupied), bags, warnings.Count == 0, warnings);
     }
 
     public async Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken)
@@ -962,6 +1012,80 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private async Task<SelectedCharacterInventoryPayload> DeserializeSelectedCharacterInventoryAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            var root = InventoryObject(document.RootElement);
+            var bagsArray = InventoryArray(root, "bags");
+            if (bagsArray.GetArrayLength() > options.Limits.MaxBagPositions) throw InvalidCharacterInventoryResponse();
+            var bags = new List<AuthenticatedInventoryBag?>();
+            long totalSlots = 0;
+            long references = 0;
+            long attributes = 0;
+            foreach (var bagElement in bagsArray.EnumerateArray())
+            {
+                if (bagElement.ValueKind == JsonValueKind.Null) { bags.Add(null); continue; }
+                var bag = InventoryObject(bagElement);
+                var id = InventoryPositiveLong(bag, "id");
+                var size = InventoryPositiveInt(bag, "size");
+                var slotsArray = InventoryArray(bag, "inventory");
+                if (slotsArray.GetArrayLength() != size || slotsArray.GetArrayLength() > options.Limits.MaxSlotsPerBag) throw InvalidCharacterInventoryResponse();
+                totalSlots = checked(totalSlots + slotsArray.GetArrayLength());
+                if (totalSlots > options.Limits.MaxTotalSlots) throw InvalidCharacterInventoryResponse();
+                references = checked(references + 1);
+                var slots = new List<AuthenticatedInventoryStack?>();
+                foreach (var stackElement in slotsArray.EnumerateArray())
+                {
+                    if (stackElement.ValueKind == JsonValueKind.Null) { slots.Add(null); continue; }
+                    var stack = ParseInventoryStack(InventoryObject(stackElement));
+                    references = checked(references + 1 + stack.Upgrades.Count + stack.Infusions.Count);
+                    attributes = checked(attributes + (stack.SelectedAttributes?.Count ?? 0));
+                    slots.Add(stack);
+                }
+                bags.Add(new AuthenticatedInventoryBag(id, size, slots));
+            }
+            if (references > options.Limits.MaxItemReferences || attributes > options.Limits.MaxStatAttributes) throw CharacterInventoryContextLimitExceeded();
+            return new SelectedCharacterInventoryPayload(bags);
+        }
+        catch (JsonException) { throw InvalidCharacterInventoryResponse(); }
+        catch (OverflowException) { throw InvalidCharacterInventoryResponse(); }
+    }
+
+    private static AuthenticatedInventoryStack ParseInventoryStack(JsonElement stack)
+    {
+        var itemId = InventoryPositiveLong(stack, "id");
+        var count = InventoryLong(stack, "count");
+        if (count is < 1 or > 250) throw InvalidCharacterInventoryResponse();
+        var charges = InventoryOptionalNonnegativeInt(stack, "charges");
+        var upgrades = InventoryOptionalPositiveLongArray(stack, "upgrades");
+        var infusions = InventoryOptionalPositiveLongArray(stack, "infusions");
+        if (upgrades.Count > 16 || infusions.Count > 16) throw InvalidCharacterInventoryResponse();
+        var skinId = InventoryOptionalPositiveLong(stack, "skin");
+        var binding = InventoryOptionalNullableString(stack, "binding");
+        var boundTo = InventoryOptionalNullableString(stack, "bound_to");
+        if ((binding == "Character" && boundTo is null) || ((binding is null or "Account") && boundTo is not null)) throw InvalidCharacterInventoryResponse();
+        long? selectedStatId = null;
+        IReadOnlyList<Gw2InventoryStatAttribute>? selectedAttributes = null;
+        if (TryInventoryProperty(stack, "stats", out var stats))
+        {
+            var statObject = InventoryObject(stats);
+            selectedStatId = InventoryPositiveLong(statObject, "id");
+            var attributes = InventoryObject(InventoryProperty(statObject, "attributes"));
+            var rows = new List<Gw2InventoryStatAttribute>();
+            foreach (var attribute in attributes.EnumerateObject())
+            {
+                if (string.IsNullOrWhiteSpace(attribute.Name) || attribute.Value.ValueKind != JsonValueKind.Number || !attribute.Value.TryGetInt32(out var value) || rows.Any(row => row.Name == attribute.Name)) throw InvalidCharacterInventoryResponse();
+                rows.Add(new Gw2InventoryStatAttribute(attribute.Name, value));
+            }
+            if (rows.Count > 32) throw InvalidCharacterInventoryResponse();
+            selectedAttributes = rows.Count == 0 ? null : rows.OrderBy(row => row.Name, StringComparer.Ordinal).ToArray();
+        }
+        return new AuthenticatedInventoryStack(itemId, count, charges, upgrades, infusions, skinId, binding, boundTo, selectedStatId, selectedAttributes);
+    }
+
     private async Task<CharacterCoreResponse> DeserializeCharacterCoreAsync(
         HttpResponseMessage response,
         string requestedName,
@@ -1282,6 +1406,98 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         catch { return new(new Dictionary<long, string>()); }
     }
 
+    private async Task<Dictionary<long, InventoryItemMetadata>> ResolveInventoryItemsAsync(IReadOnlyList<long> requestedIds, IReadOnlySet<long> primaryIds, CancellationToken cancellationToken)
+    {
+        var resolved = new Dictionary<long, InventoryItemMetadata>();
+        foreach (var chunk in requestedIds.Chunk(MaximumItemBatchSize))
+        {
+            try
+            {
+                using var response = await SendWithSingleRetryAsync($"/v2/items?ids={Uri.EscapeDataString(string.Join(',', chunk))}", cancellationToken, authenticated: false);
+                if (response.StatusCode == HttpStatusCode.NotFound) continue;
+                if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) continue;
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+                if (document.RootElement.ValueKind != JsonValueKind.Array) continue;
+                var rows = new Dictionary<long, InventoryItemMetadata>();
+                foreach (var element in document.RootElement.EnumerateArray())
+                {
+                    var item = InventoryObject(element);
+                    var id = InventoryPositiveLong(item, "id");
+                    if (!chunk.Contains(id) || !rows.TryAdd(id, ParseInventoryItemMetadata(item, id, primaryIds.Contains(id)))) throw InvalidCharacterInventoryResponse();
+                }
+                if ((response.StatusCode == HttpStatusCode.OK && rows.Count != chunk.Length)
+                    || (response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || rows.Count == chunk.Length))) continue;
+                foreach (var row in rows) resolved.Add(row.Key, row.Value);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch { }
+        }
+        return resolved;
+    }
+
+    private async Task<Dictionary<long, string>> ResolveInventoryNamesAsync(string resolver, IReadOnlyList<long> requestedIds, CancellationToken cancellationToken)
+    {
+        var resolved = new Dictionary<long, string>();
+        foreach (var chunk in requestedIds.Chunk(MaximumItemBatchSize))
+        {
+            try
+            {
+                using var response = await SendWithSingleRetryAsync($"/v2/{resolver}?ids={Uri.EscapeDataString(string.Join(',', chunk))}", cancellationToken, authenticated: false);
+                if (response.StatusCode == HttpStatusCode.NotFound) continue;
+                if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) continue;
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+                if (document.RootElement.ValueKind != JsonValueKind.Array) continue;
+                var rows = new Dictionary<long, string>();
+                foreach (var element in document.RootElement.EnumerateArray())
+                {
+                    var row = InventoryObject(element);
+                    var id = InventoryPositiveLong(row, "id");
+                    var name = InventoryString(row, "name", false);
+                    if (!chunk.Contains(id) || !rows.TryAdd(id, name)) throw InvalidCharacterInventoryResponse();
+                }
+                if ((response.StatusCode == HttpStatusCode.OK && rows.Count != chunk.Length)
+                    || (response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || rows.Count == chunk.Length))) continue;
+                foreach (var row in rows) resolved.Add(row.Key, row.Value);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch { }
+        }
+        return resolved;
+    }
+
+    private static InventoryItemMetadata ParseInventoryItemMetadata(JsonElement item, long id, bool primary)
+    {
+        var name = InventoryString(item, "name", false);
+        if (!primary) return new InventoryItemMetadata(id, name, null, null, null, null, null);
+        var type = InventoryString(item, "type", false);
+        var rarity = InventoryString(item, "rarity", false);
+        var level = InventoryInt(item, "level");
+        if (level < 0) throw InvalidCharacterInventoryResponse();
+        string? subtype = null;
+        long? defaultStatId = null;
+        if (TryInventoryProperty(item, "details", out var detailsValue))
+        {
+            var details = InventoryObject(detailsValue);
+            if (TryInventoryProperty(details, "type", out var typeValue))
+            {
+                if (typeValue.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(typeValue.GetString())) throw InvalidCharacterInventoryResponse();
+                subtype = typeValue.GetString();
+            }
+            if (TryInventoryProperty(details, "infix_upgrade", out var infixValue))
+            {
+                var infix = InventoryObject(infixValue);
+                if (TryInventoryProperty(infix, "id", out var idValue))
+                {
+                    if (idValue.ValueKind != JsonValueKind.Number || !idValue.TryGetInt64(out var statId) || statId <= 0) throw InvalidCharacterInventoryResponse();
+                    defaultStatId = statId;
+                }
+            }
+        }
+        return new InventoryItemMetadata(id, name, type, subtype, rarity, level, defaultStatId);
+    }
+
     private static Gw2EquipmentRow ToEquipmentRow(AuthenticatedEquipmentRow row, IReadOnlyDictionary<long, EquipmentItemMetadata> items, IReadOnlyDictionary<long, string> stats, IReadOnlyDictionary<long, string> skins)
     {
         items.TryGetValue(row.ItemId, out var item);
@@ -1296,6 +1512,79 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     {
         var resolvedSet = resolved.ToHashSet();
         warnings.AddRange(requested.Distinct().Where(id => !resolvedSet.Contains(id)).Order().Select(id => new Gw2MetadataWarning("metadata_unresolved", resolver, id.ToString(CultureInfo.InvariantCulture))));
+    }
+
+    private static JsonElement InventoryProperty(JsonElement element, string name)
+    {
+        var matches = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (matches.Length != 1) throw InvalidCharacterInventoryResponse();
+        return matches[0].Value;
+    }
+    private static bool TryInventoryProperty(JsonElement element, string name, out JsonElement value)
+    {
+        var matches = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (matches.Length > 1) throw InvalidCharacterInventoryResponse();
+        value = matches.Length == 1 ? matches[0].Value : default;
+        return matches.Length == 1;
+    }
+    private static JsonElement InventoryObject(JsonElement element) => element.ValueKind == JsonValueKind.Object ? element : throw InvalidCharacterInventoryResponse();
+    private static JsonElement InventoryArray(JsonElement element, string name)
+    {
+        var value = InventoryProperty(element, name);
+        return value.ValueKind == JsonValueKind.Array ? value : throw InvalidCharacterInventoryResponse();
+    }
+    private static string InventoryString(JsonElement element, string name, bool allowEmpty)
+    {
+        var value = InventoryProperty(element, name);
+        if (value.ValueKind != JsonValueKind.String || (!allowEmpty && string.IsNullOrWhiteSpace(value.GetString()))) throw InvalidCharacterInventoryResponse();
+        return value.GetString()!;
+    }
+    private static long InventoryLong(JsonElement element, string name)
+    {
+        var value = InventoryProperty(element, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number)) throw InvalidCharacterInventoryResponse();
+        return number;
+    }
+    private static long InventoryPositiveLong(JsonElement element, string name)
+    {
+        var value = InventoryLong(element, name);
+        return value > 0 ? value : throw InvalidCharacterInventoryResponse();
+    }
+    private static int InventoryPositiveInt(JsonElement element, string name)
+    {
+        var value = InventoryProperty(element, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var number) || number <= 0) throw InvalidCharacterInventoryResponse();
+        return number;
+    }
+    private static int InventoryInt(JsonElement element, string name)
+    {
+        var value = InventoryProperty(element, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var number)) throw InvalidCharacterInventoryResponse();
+        return number;
+    }
+    private static int? InventoryOptionalNonnegativeInt(JsonElement element, string name)
+    {
+        if (!TryInventoryProperty(element, name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt32(out var number) || number < 0) throw InvalidCharacterInventoryResponse();
+        return number;
+    }
+    private static long? InventoryOptionalPositiveLong(JsonElement element, string name)
+    {
+        if (!TryInventoryProperty(element, name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number) || number <= 0) throw InvalidCharacterInventoryResponse();
+        return number;
+    }
+    private static IReadOnlyList<long> InventoryOptionalPositiveLongArray(JsonElement element, string name)
+    {
+        if (!TryInventoryProperty(element, name, out var value)) return [];
+        if (value.ValueKind != JsonValueKind.Array) throw InvalidCharacterInventoryResponse();
+        return value.EnumerateArray().Select(row => row.ValueKind == JsonValueKind.Number && row.TryGetInt64(out var id) && id > 0 ? id : throw InvalidCharacterInventoryResponse()).ToArray();
+    }
+    private static string? InventoryOptionalNullableString(JsonElement element, string name)
+    {
+        if (!TryInventoryProperty(element, name, out var value) || value.ValueKind == JsonValueKind.Null) return null;
+        if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString())) throw InvalidCharacterInventoryResponse();
+        return value.GetString();
     }
 
     private static JsonElement EquipmentProperty(JsonElement element, string name)
@@ -1445,6 +1734,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
+    private static Gw2ConfigurationException CharacterInventoryContextLimitExceeded() => new("GW2 character inventory exceeds configured response limits. Try again later.");
 
     private sealed record ActiveBuildPayload(int Tab, string Name, string Profession, IReadOnlyList<SpecializationSlot> Specializations, SkillSlots TerrestrialSkills, SkillSlots AquaticSkills, PetSlots? Pets, LegendSlots? Legends);
     private sealed record SpecializationSlot(int? Id, IReadOnlyList<int?> Traits);
@@ -1490,9 +1780,86 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private sealed record EquipmentItemBatch(IReadOnlyDictionary<long, EquipmentItemMetadata> Rows);
     private sealed record EquipmentNameBatch(IReadOnlyDictionary<long, string> Rows);
     private sealed record EquipmentItemMetadata(long Id, string Name, string? Type, string? Subtype, string? Rarity, int? Level, long? DefaultStatId);
+    private sealed record SelectedCharacterInventoryPayload(IReadOnlyList<AuthenticatedInventoryBag?> Bags);
+    private sealed record AuthenticatedInventoryBag(long Id, int Size, IReadOnlyList<AuthenticatedInventoryStack?> Slots);
+    private sealed record AuthenticatedInventoryStack(long ItemId, long Count, int? Charges, IReadOnlyList<long> Upgrades, IReadOnlyList<long> Infusions, long? SkinId, string? Binding, string? BoundTo, long? SelectedStatId, IReadOnlyList<Gw2InventoryStatAttribute>? SelectedAttributes);
+    private sealed record InventoryItemMetadata(long Id, string Name, string? Type, string? Subtype, string? Rarity, int? Level, long? DefaultStatId);
 }
 
-public sealed record Gw2ApiOptions(string ApiKey, string BaseUrl);
+public sealed record CharacterInventoryLimits(
+    int MaxBagPositions,
+    int MaxSlotsPerBag,
+    int MaxTotalSlots,
+    int MaxItemReferences,
+    int MaxStatAttributes)
+{
+    public static CharacterInventoryLimits Default { get; } = new(20, 40, 640, 1024, 2048);
+
+    public static CharacterInventoryLimits FromConfiguration(IConfiguration configuration)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        var invalidSettings = new List<string>();
+        var bagPositions = ReadSetting(configuration, "GW2_CHARACTER_INVENTORY_MAX_BAG_POSITIONS", Default.MaxBagPositions, invalidSettings);
+        var slotsPerBag = ReadSetting(configuration, "GW2_CHARACTER_INVENTORY_MAX_SLOTS_PER_BAG", Default.MaxSlotsPerBag, invalidSettings);
+        var totalSlots = ReadSetting(configuration, "GW2_CHARACTER_INVENTORY_MAX_TOTAL_SLOTS", Default.MaxTotalSlots, invalidSettings);
+        var itemReferences = ReadSetting(configuration, "GW2_CHARACTER_INVENTORY_MAX_ITEM_REFERENCES", Default.MaxItemReferences, invalidSettings);
+        var statAttributes = ReadSetting(configuration, "GW2_CHARACTER_INVENTORY_MAX_STAT_ATTRIBUTES", Default.MaxStatAttributes, invalidSettings);
+
+        if (invalidSettings.Count == 0)
+        {
+            var maximumPossibleSlots = checked((long)bagPositions * slotsPerBag);
+            if (totalSlots < slotsPerBag || totalSlots > maximumPossibleSlots)
+            {
+                invalidSettings.Add("GW2_CHARACTER_INVENTORY_MAX_TOTAL_SLOTS");
+            }
+
+            if (itemReferences < checked((long)bagPositions + totalSlots))
+            {
+                invalidSettings.Add("GW2_CHARACTER_INVENTORY_MAX_ITEM_REFERENCES");
+            }
+        }
+
+        if (invalidSettings.Count != 0)
+        {
+            throw new Gw2ConfigurationException($"Invalid character inventory limit configuration: {string.Join(", ", invalidSettings.Distinct(StringComparer.Ordinal))}.");
+        }
+
+        return new CharacterInventoryLimits(bagPositions, slotsPerBag, totalSlots, itemReferences, statAttributes);
+    }
+
+    private static int ReadSetting(IConfiguration configuration, string settingName, int fallback, List<string> invalidSettings)
+    {
+        var raw = configuration[settingName];
+        if (string.IsNullOrWhiteSpace(raw)) return fallback;
+        if (!int.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var value) || value <= 0)
+        {
+            invalidSettings.Add(settingName);
+            return fallback;
+        }
+
+        return value;
+    }
+}
+
+public sealed record Gw2ApiOptions
+{
+    public Gw2ApiOptions(string apiKey, string baseUrl)
+        : this(apiKey, baseUrl, CharacterInventoryLimits.Default)
+    {
+    }
+
+    public Gw2ApiOptions(string apiKey, string baseUrl, CharacterInventoryLimits limits)
+    {
+        ArgumentNullException.ThrowIfNull(limits);
+        ApiKey = apiKey;
+        BaseUrl = baseUrl;
+        Limits = limits;
+    }
+
+    public string ApiKey { get; }
+    public string BaseUrl { get; }
+    public CharacterInventoryLimits Limits { get; }
+}
 
 public sealed class Gw2ConfigurationException(string message) : Exception(message);
 
@@ -1546,6 +1913,16 @@ public sealed record Gw2EquipmentItem(long Id, string? Name, string? Type, strin
 public sealed record Gw2EquipmentStat(long Id, string? Name, string Source, IReadOnlyList<Gw2EquipmentStatAttribute>? Attributes);
 public sealed record Gw2EquipmentStatAttribute(string Name, int Value);
 public sealed record Gw2EquipmentReference(long Id, string? Name);
+public sealed record Gw2CharacterInventory(string CharacterName, Gw2CharacterInventoryCapacity Capacity, IReadOnlyList<Gw2CharacterInventoryBag> Bags, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
+public sealed record Gw2CharacterInventoryCapacity(int BagPositions, int EquippedBags, int TotalSlots, int OccupiedSlots, int EmptySlots);
+public sealed record Gw2CharacterInventoryBag(int BagPosition, Gw2InventoryBag? Bag, IReadOnlyList<Gw2CharacterInventorySlot> Slots);
+public sealed record Gw2InventoryBag(long Id, string? Name, int Size);
+public sealed record Gw2CharacterInventorySlot(int SlotPosition, Gw2InventoryStack? Stack);
+public sealed record Gw2InventoryStack(Gw2InventoryItem Item, long Count, int? Charges, Gw2InventoryStat? Stats, IReadOnlyList<Gw2InventoryReference> Upgrades, IReadOnlyList<Gw2InventoryReference> Infusions, Gw2InventoryReference? Skin, string? Binding, string? BoundTo);
+public sealed record Gw2InventoryItem(long Id, string? Name, string? Type, string? Subtype, string? Rarity, int? Level);
+public sealed record Gw2InventoryStat(long Id, string? Name, string Source, IReadOnlyList<Gw2InventoryStatAttribute>? Attributes);
+public sealed record Gw2InventoryStatAttribute(string Name, int Value);
+public sealed record Gw2InventoryReference(long Id, string? Name);
 public enum Gw2StorageSource
 {
     Bank,

@@ -2055,8 +2055,326 @@ public sealed class Gw2ApiClientTests
         { new ResponseSpec("private active", HttpStatusCode.InternalServerError) }
     };
 
+    [Fact]
+    public async Task GetCharacterInventoryAsync_selects_exact_roster_name_preserves_positions_and_maps_stack_metadata()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""", """["Other Hero","Path/Query?# Hero"]""",
+            """{"bags":[null,{"id":10,"size":2,"inventory":[null,{"id":1,"count":2,"charges":0,"upgrades":[2,2],"infusions":[3],"skin":4,"binding":"Character","bound_to":"Path/Query?# Hero","stats":{"id":5,"attributes":{"Zeta":2,"Alpha":1}}}]}]}""",
+            """[{"id":1,"name":"Sword","type":"Weapon","rarity":"Rare","level":80,"details":{"type":"Sword","infix_upgrade":{"id":6}}},{"id":2,"name":"Upgrade"},{"id":3,"name":"Infusion"},{"id":10,"name":"Bag"}]""",
+            """[{"id":5,"name":"Selected"}]""", """[{"id":4,"name":"Skin"}]"""
+        );
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Path/Query?# Hero", CancellationToken.None);
+
+        Assert.Equal((2, 1, 2, 1, 1), (inventory.Capacity.BagPositions, inventory.Capacity.EquippedBags, inventory.Capacity.TotalSlots, inventory.Capacity.OccupiedSlots, inventory.Capacity.EmptySlots));
+        Assert.Null(inventory.Bags[0].Bag);
+        var stack = inventory.Bags[1].Slots[1].Stack!;
+        Assert.Equal(("Sword", 2L, 0, "Character", "Path/Query?# Hero"), (stack.Item.Name, stack.Count, stack.Charges, stack.Binding, stack.BoundTo));
+        Assert.Equal(["Alpha", "Zeta"], stack.Stats!.Attributes!.Select(attribute => attribute.Name));
+        Assert.Equal([2L, 2L], stack.Upgrades.Select(upgrade => upgrade.Id));
+        Assert.Equal("Selected", stack.Stats.Name);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Path%2FQuery%3F%23%20Hero/inventory?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/items?ids=1%2C2%2C3%2C10&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/itemstats?ids=5&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/skins?ids=4&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_degrades_only_invalid_metadata_batches_and_orders_canonical_warnings()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","characters","inventories"]}""", """["Synthetic Hero"]""",
+            """{"bags":[{"id":10,"size":2,"inventory":[{"id":2,"count":1,"stats":{"id":4,"attributes":{}}},{"id":1,"count":1,"skin":3}]}]}""",
+            new ResponseSpec("[]", HttpStatusCode.NotFound), new ResponseSpec("[]", HttpStatusCode.PartialContent), new ResponseSpec("[]", HttpStatusCode.NotFound));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.False(inventory.IsMetadataComplete);
+        Assert.Equal([("items", "1"), ("items", "2"), ("items", "10"), ("itemstats", "4"), ("skins", "3")], inventory.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+        Assert.Null(inventory.Bags[0].Slots[0].Stack!.Stats!.Name);
+        Assert.Null(inventory.Bags[0].Slots[1].Stack!.Skin!.Name);
+    }
+
+    [Theory]
+    [MemberData(nameof(SelectedInventoryBounds))]
+    public async Task GetCharacterInventoryAsync_enforces_each_configured_bound_at_and_over_the_limit(CharacterInventoryLimits limits, string atLimit, string overLimit)
+    {
+        var atHandler = InventoryHandler(atLimit, "[]");
+        using var atClient = new HttpClient(atHandler) { BaseAddress = new Uri("https://example.test") };
+        await new Gw2ApiClient(atClient, new Gw2ApiOptions(new string('k', 16), "https://example.test", limits)).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        var overHandler = InventoryHandler(overLimit, "[]");
+        using var overClient = new HttpClient(overHandler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(overClient, new Gw2ApiOptions(new string('k', 16), "https://example.test", limits)).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Contains("inventory", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(3, overHandler.RequestUris.Count);
+    }
+
+    public static TheoryData<CharacterInventoryLimits, string, string> SelectedInventoryBounds => new()
+    {
+        { new CharacterInventoryLimits(1, 1, 1, 2, 1), "{\"bags\":[null]}", "{\"bags\":[null,null]}" },
+        { new CharacterInventoryLimits(1, 1, 2, 3, 1), Inventory("{\"id\":10,\"size\":1,\"inventory\":[null]}"), Inventory("{\"id\":10,\"size\":2,\"inventory\":[null,null]}") },
+        { new CharacterInventoryLimits(2, 2, 2, 4, 1), Inventory("{\"id\":10,\"size\":1,\"inventory\":[null]}", "{\"id\":11,\"size\":1,\"inventory\":[null]}"), Inventory("{\"id\":10,\"size\":2,\"inventory\":[null,null]}", "{\"id\":11,\"size\":1,\"inventory\":[null]}") },
+        { new CharacterInventoryLimits(1, 1, 1, 2, 1), Inventory("{\"id\":10,\"size\":1,\"inventory\":[{\"id\":1,\"count\":1}]}"), Inventory("{\"id\":10,\"size\":1,\"inventory\":[{\"id\":1,\"count\":1,\"upgrades\":[2]}]}") },
+        { new CharacterInventoryLimits(1, 1, 1, 2, 2), Inventory("{\"id\":10,\"size\":1,\"inventory\":[{\"id\":1,\"count\":1,\"stats\":{\"id\":2,\"attributes\":{\"A\":1,\"B\":2}}}]}"), Inventory("{\"id\":10,\"size\":1,\"inventory\":[{\"id\":1,\"count\":1,\"stats\":{\"id\":2,\"attributes\":{\"A\":1,\"B\":2,\"C\":3}}}]}") }
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidSelectedInventoryPayloads))]
+    public async Task GetCharacterInventoryAsync_rejects_structural_and_per_stack_contradictions(string payload)
+    {
+        var handler = InventoryHandler(payload, "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<string> InvalidSelectedInventoryPayloads => new()
+    {
+        { "{\"bags\":[],\"bags\":[]}" },
+        { Inventory("{\"id\":1,\"size\":2,\"inventory\":[null]}") },
+        { StackPayload("{\"id\":1,\"count\":0}") }, { StackPayload("{\"id\":1,\"count\":251}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"charges\":-1}") }, { StackPayload("{\"id\":1,\"count\":1,\"charges\":1.5}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"stats\":{\"id\":2,\"attributes\":[]}}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"stats\":{\"id\":2,\"attributes\":{\"A\":1,\"A\":2}}}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"stats\":{\"id\":2,\"attributes\":{" + string.Join(',', Enumerable.Range(1, 33).Select(id => "\"A" + id + "\":1")) + "}}}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"upgrades\":[" + string.Join(',', Enumerable.Repeat("2", 17)) + "]}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"infusions\":[" + string.Join(',', Enumerable.Repeat("2", 17)) + "]}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"binding\":\"Character\"}") },
+        { StackPayload("{\"id\":1,\"count\":1,\"binding\":\"Account\",\"bound_to\":\"Synthetic Hero\"}") }
+    };
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_accepts_future_binding_additive_fields_and_per_stack_component_maxima()
+    {
+        var payload = StackPayload("{\"id\":1,\"count\":1,\"binding\":\"FutureBinding\",\"bound_to\":\"Synthetic Hero\",\"upgrades\":[" + string.Join(',', Enumerable.Repeat("2", 16)) + "],\"infusions\":[" + string.Join(',', Enumerable.Repeat("3", 16)) + "],\"future\":true}", ",\"future_outer\":true");
+        var handler = InventoryHandler(payload, "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal("FutureBinding", inventory.Bags[0].Slots[0].Stack!.Binding);
+        Assert.Equal((16, 16), (inventory.Bags[0].Slots[0].Stack!.Upgrades.Count, inventory.Bags[0].Slots[0].Stack!.Infusions.Count));
+    }
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_skips_public_calls_without_metadata_references_and_batches_ascending_items_sequentially()
+    {
+        var emptyHandler = InventoryHandler("""{"bags":[]}""");
+        using var emptyClient = new HttpClient(emptyHandler) { BaseAddress = new Uri("https://example.test") };
+        await new Gw2ApiClient(emptyClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+        Assert.Equal(3, emptyHandler.RequestUris.Count);
+
+        var firstChunk = Enumerable.Range(1, 200).Select(id => (long)id).ToArray();
+        var secondChunk = new[] { 201L }.Concat(Enumerable.Range(1001, 6).Select(id => (long)id)).ToArray();
+        var handler = InventoryHandler(LargeInventoryPayload(), ItemMetadata(firstChunk), ItemMetadata(secondChunk));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.True(inventory.IsMetadataComplete);
+        Assert.Equal("/v2/items?ids=" + Uri.EscapeDataString(string.Join(',', firstChunk)) + "&lang=en&v=2025-08-29T01%3A00%3A00.000Z", handler.RequestUris[3]);
+        Assert.Equal("/v2/items?ids=" + Uri.EscapeDataString(string.Join(',', secondChunk)) + "&lang=en&v=2025-08-29T01%3A00%3A00.000Z", handler.RequestUris[4]);
+    }
+
+    [Theory]
+    [MemberData(nameof(DegradedItemBatches))]
+    public async Task GetCharacterInventoryAsync_continues_after_item_batch_degradation_and_keeps_later_metadata(object firstResponse)
+    {
+        var firstChunk = Enumerable.Range(1, 200).Select(id => (long)id).ToArray();
+        var secondChunk = new[] { 201L }.Concat(Enumerable.Range(1001, 6).Select(id => (long)id)).ToArray();
+        var handler = InventoryHandler(LargeInventoryPayload(), firstResponse, ItemMetadata(secondChunk));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.False(inventory.IsMetadataComplete);
+        Assert.Equal(200, inventory.Warnings.Count(warning => warning.Resolver == "items"));
+        Assert.Equal("Item 201", inventory.Bags.SelectMany(bag => bag.Slots).Select(slot => slot.Stack).First(stack => stack?.Item.Id == 201)!.Item.Name);
+        Assert.Equal(5, handler.RequestUris.Count);
+    }
+
+    public static TheoryData<object> DegradedItemBatches => new()
+    {
+        { new ResponseSpec("[]", HttpStatusCode.NotFound) },
+        { new ResponseSpec("[]", HttpStatusCode.BadRequest) },
+        { new ResponseSpec("not-json") },
+        { new HttpRequestException("public item failure") },
+        { new OperationCanceledException("public item timeout") }
+    };
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_retains_a_valid_nonempty_strict_206_item_subset()
+    {
+        var handler = InventoryHandler(MetadataInventoryPayload(), new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":80}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal("One", inventory.Bags[0].Slots[0].Stack!.Item.Name);
+        Assert.Equal([("items", "2"), ("items", "10")], inventory.Warnings.Select(warning => (warning.Resolver, warning.ReferenceId)));
+    }
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_uses_item_default_stats_when_authenticated_selected_stats_are_absent()
+    {
+        var handler = InventoryHandler(StackPayload("{\"id\":1,\"count\":1}"),
+            """[{"id":1,"name":"Sword","type":"Weapon","rarity":"Rare","level":80,"details":{"infix_upgrade":{"id":7}}},{"id":10,"name":"Bag"}]""",
+            """[{"id":7,"name":"Default prefix"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        var stat = inventory.Bags[0].Slots[0].Stack!.Stats!;
+        Assert.Equal((7L, "Default prefix", "ItemDefault"), (stat.Id, stat.Name, stat.Source));
+        Assert.Null(stat.Attributes);
+        Assert.Equal(
+            ["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Synthetic%20Hero/inventory?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/items?ids=1%2C10&lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/itemstats?ids=7&lang=en&v=2025-08-29T01%3A00%3A00.000Z"],
+            handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_continues_skin_name_batches_after_an_invalid_first_chunk()
+    {
+        var skinIds = Enumerable.Range(1, 201).Select(id => (long)id).ToArray();
+        var firstChunk = skinIds[..200];
+        var limits = new CharacterInventoryLimits(6, 40, 240, 300, 1);
+        var handler = InventoryHandler(LargeSkinInventoryPayload(), ItemMetadata(new[] { 1L }.Concat(Enumerable.Range(1001, 6).Select(id => (long)id))),
+            """[{"id":1,"name":"First"},{"id":1,"name":"Duplicate"}]""",
+            """[{"id":201,"name":"Last skin"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test", limits)).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        var stacks = inventory.Bags.SelectMany(bag => bag.Slots).Select(slot => slot.Stack).Where(stack => stack is not null).Select(stack => stack!).ToArray();
+        Assert.Null(stacks[0].Skin!.Name);
+        Assert.Equal("Last skin", stacks.Single(stack => stack.Skin!.Id == 201).Skin!.Name);
+        var warnings = inventory.Warnings.Where(warning => warning.Resolver == "skins").ToArray();
+        Assert.Equal(200, warnings.Length);
+        Assert.Equal(Enumerable.Range(1, 200).Select(id => id.ToString()), warnings.Select(warning => warning.ReferenceId));
+        Assert.Equal("/v2/skins?ids=" + Uri.EscapeDataString(string.Join(',', firstChunk)) + "&lang=en&v=2025-08-29T01%3A00%3A00.000Z", handler.RequestUris[4]);
+        Assert.Equal("/v2/skins?ids=201&lang=en&v=2025-08-29T01%3A00%3A00.000Z", handler.RequestUris[5]);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidItemMetadataBatches))]
+    public async Task GetCharacterInventoryAsync_discards_only_invalid_item_metadata_batches(object response)
+    {
+        var handler = InventoryHandler(MetadataInventoryPayload(), response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var inventory = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal(["1", "2", "10"], inventory.Warnings.Where(warning => warning.Resolver == "items").Select(warning => warning.ReferenceId));
+    }
+
+    public static TheoryData<object> InvalidItemMetadataBatches => new()
+    {
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":80},{"id":1,"name":"Again","type":"Weapon","rarity":"Rare","level":80}]""") },
+        { new ResponseSpec("""[{"id":99,"name":"Other","type":"Weapon","rarity":"Rare","level":80}]""") },
+        { new ResponseSpec("not-json") },
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":80},{"id":2,"name":"Two","type":"Weapon","rarity":"Rare","level":80},{"id":10,"name":"Bag"}]""", HttpStatusCode.PartialContent) }
+    };
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_propagates_caller_cancellation_during_public_metadata_without_later_requests()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        RecordingHandler? handler = null;
+        handler = InventoryHandler(MetadataInventoryPayload(), () => { if (handler!.RequestUris.Count == 4) cancellationSource.Cancel(); }, """[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":80},{"id":2,"name":"Two","type":"Weapon","rarity":"Rare","level":80},{"id":10,"name":"Bag"}]""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", cancellationSource.Token));
+
+        Assert.Equal(4, handler.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("account")]
+    [InlineData("characters")]
+    [InlineData("inventories")]
+    public async Task GetCharacterInventoryAsync_requires_each_permission_before_roster(string missingPermission)
+    {
+        var permissions = new[] { "account", "characters", "inventories" }.Where(permission => permission != missingPermission);
+        var handler = new RecordingHandler("{\"permissions\":[" + string.Join(',', permissions.Select(permission => "\"" + permission + "\"")) + "]}");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Contains(missingPermission + " permission", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterInventoryAsync_propagates_caller_cancellation_without_later_requests()
+    {
+        using var cancellationSource = new CancellationTokenSource();
+        var handler = new RecordingHandler("""{"permissions":["account","characters","inventories"]}""") { OnRequest = cancellationSource.Cancel };
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", cancellationSource.Token));
+
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData(206)]
+    [InlineData(404)]
+    [InlineData(500)]
+    public async Task GetCharacterInventoryAsync_redacts_roster_not_found_and_private_failures(int status)
+    {
+        var rosterHandler = new RecordingHandler("""{"permissions":["account","characters","inventories"]}""", """["Other Hero"]""");
+        using var rosterClient = new HttpClient(rosterHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(rosterClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None));
+
+        var privateHandler = new RecordingHandler("""{"permissions":["account","characters","inventories"]}""", """["Synthetic Hero"]""", new ResponseSpec("private detail", (HttpStatusCode)status));
+        using var privateClient = new HttpClient(privateHandler) { BaseAddress = new Uri("https://example.test") };
+        var privateError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(privateClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCharacterInventoryAsync("Synthetic Hero", CancellationToken.None));
+        Assert.DoesNotContain("Synthetic Hero", privateError.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private detail", privateError.Message, StringComparison.Ordinal);
+    }
+
     private const string EquipmentPermissions = """{"permissions":["account","characters","builds","inventories"]}""";
     private const string EquipmentRoster = """["Synthetic Hero"]""";
+    private static RecordingHandler InventoryHandler(string inventory, params object[] publicResponses) => new([
+        """{"permissions":["account","characters","inventories"]}""", """["Synthetic Hero"]""", inventory,
+        .. publicResponses,
+        new ResponseSpec("[]", HttpStatusCode.NotFound), new ResponseSpec("[]", HttpStatusCode.NotFound), new ResponseSpec("[]", HttpStatusCode.NotFound)
+    ]);
+    private static RecordingHandler InventoryHandler(string inventory, Action onRequest, params object[] publicResponses) => new([
+        """{"permissions":["account","characters","inventories"]}""", """["Synthetic Hero"]""", inventory,
+        .. publicResponses,
+        new ResponseSpec("[]", HttpStatusCode.NotFound), new ResponseSpec("[]", HttpStatusCode.NotFound), new ResponseSpec("[]", HttpStatusCode.NotFound)
+    ]) { OnRequest = onRequest };
+    private static string Inventory(params string[] bags) => "{\"bags\":[" + string.Join(',', bags) + "]}";
+    private static string StackPayload(string stack, string rootExtra = "") => "{\"bags\":[{\"id\":10,\"size\":1,\"inventory\":[" + stack + "]}]" + rootExtra + "}";
+    private static string LargeInventoryPayload()
+    {
+        var itemId = 1;
+        var bags = Enumerable.Range(0, 6).Select(bag =>
+        {
+            var slots = Enumerable.Range(0, 40).Select(_ => itemId <= 201 ? "{\"id\":" + itemId++ + ",\"count\":1}" : "null");
+            return "{\"id\":" + (1001 + bag) + ",\"size\":40,\"inventory\":[" + string.Join(',', slots) + "]}";
+        });
+        return Inventory(bags.ToArray());
+    }
+    private static string LargeSkinInventoryPayload()
+    {
+        var skinId = 1;
+        var bags = Enumerable.Range(0, 6).Select(bag =>
+        {
+            var slots = Enumerable.Range(0, 40).Select(_ => skinId <= 201 ? "{\"id\":1,\"count\":1,\"skin\":" + skinId++ + "}" : "null");
+            return "{\"id\":" + (1001 + bag) + ",\"size\":40,\"inventory\":[" + string.Join(',', slots) + "]}";
+        });
+        return Inventory(bags.ToArray());
+    }
+    private static string MetadataInventoryPayload() => Inventory("{\"id\":10,\"size\":2,\"inventory\":[{\"id\":1,\"count\":1},{\"id\":2,\"count\":1}]}");
+    private static string ItemMetadata(IEnumerable<long> ids) => "[" + string.Join(',', ids.Select(id => id <= 201
+        ? "{\"id\":" + id + ",\"name\":\"Item " + id + "\",\"type\":\"Weapon\",\"rarity\":\"Rare\",\"level\":80}"
+        : "{\"id\":" + id + ",\"name\":\"Bag " + id + "\"}")) + "]";
     private static Gw2ApiClient EquipmentClient(HttpClient client) => new(client, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
     private static string ActiveEquipment(string equipment) => "{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":" + equipment + "}";
     private static string EquipmentRow(string slot, int id, string extra = "") => "{\"slot\":\"" + slot + "\",\"id\":" + id + ",\"location\":\"Equipped\"" + extra + "}";

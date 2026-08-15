@@ -4,12 +4,13 @@ Local, read-only Guild Wars 2 account facts over stateless Streamable HTTP MCP.
 
 ## Current scope
 
-The server exposes seven tools:
+The server exposes eight tools:
 
 - `find_items` resolves a bounded English item-name fragment from the generated local public cache. It returns exact matches before contains matches with canonical ID, name, type, rarity, level, and match kind. It does not call the GW2 API at request time or choose among ambiguous names.
 - `get_account` validates the configured key through `/v2/tokeninfo`, requires `account`, and returns basic account facts with an `asOf` timestamp.
 - `get_character_build` accepts one exact character name from `get_characters`, requires `account`, `characters`, and `builds`, verifies that name against the complete roster, and returns only that character's active build tab. It preserves fixed specialization, trait, terrestrial/aquatic skill, Ranger pet, and Revenant legend slots; resolves referenced public metadata to compact names where available; and retains unresolved IDs with deterministic warnings and `isMetadataComplete: false`. It does not return inventory, equipment, inactive tabs, or ownership quantities.
 - `get_character_equipment` accepts one exact character name from `get_characters`, requires `account`, `characters`, `builds`, and `inventories`, and returns that character's active PvE/WvW combat-equipment references. It uses the active equipment tab plus a conditional current-equipment lookup for the API's missing Relic, resolves compact item, prefix, upgrade, infusion, and skin metadata, preserves unresolved canonical IDs with warnings, and explicitly marks the result as non-ownership data. It includes terrestrial and aquatic combat slots but excludes PvP, dyes, gathering, fishing, Jade Bot equipment, inventory, inactive tabs, quantities, and Legendary Armory ownership.
+- `get_character_inventory` accepts one exact character name from `get_characters`, requires `account`, `characters`, and `inventories`, and returns that character's complete bounded physical equipped-bag layout. It preserves zero-based bag and slot positions, absent bags, empty slots, per-slot stack counts and charges, binding, selected/default stats, upgrades, infusions, and skins, with compact public names where available and deterministic metadata warnings otherwise. Its physical stack counts are already represented by `get_account_holdings` character-bag contributions and must not be added as a second ownership source; it returns no per-item totals and excludes account storage, equipment references, inactive tabs, and Legendary Armory ownership.
 - `get_characters` requires `account` and `characters`, retrieves the complete character list and each character's core record, and returns name-ordered summaries with name, race, gender, profession, level, playtime seconds, creation and last-modified timestamps, and deaths. The result is complete or the whole operation fails; it does not include inventory, equipment, builds, guild, or title data.
 - `get_wallet` requires `account` and `wallet`, retrieves `/v2/account/wallet`, and joins each canonical currency ID to its English `/v2/currencies` name. It returns `long` values, one `asOf` timestamp, and warnings that retain the ID and value when metadata is unavailable. An empty wallet is returned as an empty balance list.
 - `get_account_holdings` accepts separate optional `itemIds` and `currencyIds` arrays, requires at least one ID, and permits at most 20 combined positive IDs with no duplicates within either array. It preserves caller order and treats item and currency IDs as separate canonical namespaces, so the same numeric ID may appear once in each array.
@@ -35,6 +36,18 @@ $env:GW2_API_KEY = "<your-GW2-key>"
 ```
 
 `appsettings.example.json` has only non-secret configuration. `GW2_API_BASE_URL` defaults to `https://api.guildwars2.com` and may point to a local fake server in tests. `GW2_PUBLIC_CACHE_PATH` defaults to `data/public-cache`, and `GW2_API_BUDGET_LOCK_PATH` defaults to `data/gw2-api-budget.lock`; both paths are resolved from the repository-root working directory used by the commands below.
+
+Selected-character inventory has these server-owned safety limits:
+
+| Setting | Default |
+|---|---:|
+| `GW2_CHARACTER_INVENTORY_MAX_BAG_POSITIONS` | 20 |
+| `GW2_CHARACTER_INVENTORY_MAX_SLOTS_PER_BAG` | 40 |
+| `GW2_CHARACTER_INVENTORY_MAX_TOTAL_SLOTS` | 640 |
+| `GW2_CHARACTER_INVENTORY_MAX_ITEM_REFERENCES` | 1024 |
+| `GW2_CHARACTER_INVENTORY_MAX_STAT_ATTRIBUTES` | 2048 |
+
+The defaults cover the current documented maximum of 16 bags with 32 slots each and leave modest headroom. Raise them only after verifying an ArenaNet capacity change. Values must be positive 32-bit integers; total slots must be at least slots per bag and no greater than bag positions multiplied by slots per bag, and item references must be at least bag positions plus total slots. Changes take effect after a server restart. Higher values can materially increase response size, metadata request count, latency, and model-context use. No hard upper ceiling is imposed because these are trusted server-owner settings; per-stack structural limits remain fixed.
 
 ## Refresh the public item cache
 
@@ -152,6 +165,7 @@ npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport 
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_build --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_equipment --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_inventory --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_characters --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_wallet --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account_holdings --tool-args-json '{"itemIds":[101,202],"currencyIds":[3]}' --format json
@@ -167,4 +181,4 @@ Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create
 tunnel-client init --sample sample_mcp_remote_no_auth --profile gw2-account --tunnel-id <tunnel-id> --mcp-server-url http://127.0.0.1:5288/mcp
 ```
 
-Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `find_items`, `get_account`, `get_account_holdings`, `get_character_build`, `get_character_equipment`, `get_characters`, and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.
+Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `find_items`, `get_account`, `get_account_holdings`, `get_character_build`, `get_character_equipment`, `get_character_inventory`, `get_characters`, and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.

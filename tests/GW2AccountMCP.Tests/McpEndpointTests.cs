@@ -17,7 +17,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_seven_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_eight_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -27,7 +27,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_characters", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -113,6 +113,32 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.Equal(["slot", "item", "stats", "upgrades", "infusions", "skin", "binding", "boundTo", "location", "referenceKind"], equipmentRowSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
         var equipmentItemSchema = equipmentRowSchema.GetProperty("properties").GetProperty("item");
         Assert.Equal(["id", "name", "type", "subtype", "rarity", "level"], equipmentItemSchema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+
+        var characterInventory = toolsByName["get_character_inventory"];
+        Assert.Equal(["characterName"], characterInventory.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["characterName"], characterInventory.GetProperty("inputSchema").GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var inventoryOutput = characterInventory.GetProperty("outputSchema");
+        Assert.Equal(["characterName", "inventoryScope", "capacity", "bags", "isMetadataComplete", "warnings", "asOf"], inventoryOutput.GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["characterName", "inventoryScope", "capacity", "bags", "isMetadataComplete", "warnings", "asOf"], inventoryOutput.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+        var inventoryProperties = inventoryOutput.GetProperty("properties");
+        AssertSchemaRequired(inventoryProperties.GetProperty("capacity"), "bagPositions", "equippedBags", "totalSlots", "occupiedSlots", "emptySlots");
+        var bagSchema = inventoryProperties.GetProperty("bags").GetProperty("items");
+        AssertSchemaRequired(bagSchema, "bagPosition", "bag", "slots");
+        var bagDetailsSchema = bagSchema.GetProperty("properties").GetProperty("bag");
+        AssertSchemaRequired(bagDetailsSchema, "id", "name", "size");
+        var slotSchema = bagSchema.GetProperty("properties").GetProperty("slots").GetProperty("items");
+        AssertSchemaRequired(slotSchema, "slotPosition", "stack");
+        var stackSchema = slotSchema.GetProperty("properties").GetProperty("stack");
+        AssertSchemaRequired(stackSchema, "item", "count", "charges", "stats", "upgrades", "infusions", "skin", "binding", "boundTo");
+        AssertSchemaRequired(stackSchema.GetProperty("properties").GetProperty("item"), "id", "name", "type", "subtype", "rarity", "level");
+        var statsSchema = stackSchema.GetProperty("properties").GetProperty("stats");
+        AssertSchemaRequired(statsSchema, "id", "name", "source", "attributes");
+        AssertSchemaRequired(statsSchema.GetProperty("properties").GetProperty("attributes").GetProperty("items"), "name", "value");
+        AssertSchemaRequired(stackSchema.GetProperty("properties").GetProperty("upgrades").GetProperty("items"), "id", "name");
+        AssertSchemaRequired(inventoryProperties.GetProperty("warnings").GetProperty("items"), "code", "resolver", "referenceId");
+        Assert.DoesNotContain("ownedTotal", characterInventory.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("GW2_CHARACTER_INVENTORY", characterInventory.GetRawText(), StringComparison.Ordinal);
+        Assert.Contains("must not be added as a second ownership source", characterInventory.GetProperty("description").GetString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -303,6 +329,22 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     }
 
     [Fact]
+    public async Task GetCharacterInventory_returns_selected_bag_scope_with_explicit_nulls()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(15, "tools/call", new { name = "get_character_inventory", arguments = new { characterName = "Synthetic Hero" } });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal("SelectedCharacterPhysicalBags", structured.GetProperty("inventoryScope").GetString());
+        var bag = Assert.Single(structured.GetProperty("bags").EnumerateArray());
+        Assert.Equal(JsonValueKind.Null, bag.GetProperty("bag").GetProperty("name").ValueKind);
+        Assert.Equal(JsonValueKind.Null, Assert.Single(bag.GetProperty("slots").EnumerateArray()).GetProperty("stack").ValueKind);
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("asOf").GetString());
+    }
+
+    [Fact]
     public async Task GetAccountHoldings_returns_safe_structured_complete_aggregation()
     {
         await InitializeAsync();
@@ -413,6 +455,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         return httpClient.SendAsync(request);
     }
 
+    private static void AssertSchemaRequired(JsonElement schema, params string[] names) =>
+        Assert.Equal(names, schema.GetProperty("required").EnumerateArray().Select(value => value.GetString()));
+
     private static async Task<string> ReadMcpResponseAsync(HttpResponseMessage response)
     {
         var body = await response.Content.ReadAsStringAsync();
@@ -501,6 +546,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             Task.FromResult(new Gw2CharacterEquipment("Synthetic Hero", 1, "", [
                 new Gw2EquipmentRow("Helm", new Gw2EquipmentItem(1, null, null, null, null, null), null, [], [], null, null, null, "Equipped", "EquippedReference")
             ], true, []));
+        public Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2CharacterInventory("Synthetic Hero", new Gw2CharacterInventoryCapacity(1, 1, 1, 0, 1), [new Gw2CharacterInventoryBag(0, new Gw2InventoryBag(1, null, 1), [new Gw2CharacterInventorySlot(0, null)])], true, []));
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2AccountStorage([new Gw2StorageStack(101, 2, Gw2StorageSource.Bank, 0)]));
@@ -535,6 +582,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required builds permission. Create a key with the builds permission.");
+        public Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required inventories permission. Create a key with the inventories permission.");
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required inventories permission. Create a key with the inventories permission.");
@@ -566,6 +615,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("Synthetic storage failure.");

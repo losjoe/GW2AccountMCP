@@ -84,6 +84,7 @@ public sealed class GetCharacterEquipmentTests
             Calls.Add("equipment");
             return Error is null ? Task.FromResult(Equipment) : Task.FromException<Gw2CharacterEquipment>(Error);
         }
+        public Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) => throw new NotSupportedException();

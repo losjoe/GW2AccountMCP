@@ -4,9 +4,11 @@ using GW2AccountMCP.Tools;
 
 var builder = WebApplication.CreateBuilder(args);
 
+var characterInventoryLimits = CharacterInventoryLimits.FromConfiguration(builder.Configuration);
 var gw2Options = new Gw2ApiOptions(
     builder.Configuration["GW2_API_KEY"] ?? string.Empty,
-    builder.Configuration["GW2_API_BASE_URL"] ?? "https://api.guildwars2.com");
+    builder.Configuration["GW2_API_BASE_URL"] ?? "https://api.guildwars2.com",
+    characterInventoryLimits);
 var gw2ApiBudgetLeaseOptions = new Gw2ApiBudgetLeaseOptions(
     builder.Configuration["GW2_API_BUDGET_LOCK_PATH"] ?? "data/gw2-api-budget.lock");
 var itemCacheOptions = new ItemCacheOptions(
@@ -34,6 +36,7 @@ builder.Services
     .WithTools<GetAccountHoldingsTool>()
     .WithTools<GetCharacterBuildTool>()
     .WithTools<GetCharacterEquipmentTool>()
+    .WithTools<GetCharacterInventoryTool>()
     .WithTools<GetCharactersTool>()
     .WithTools<GetWalletTool>();
 
