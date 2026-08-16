@@ -3300,6 +3300,341 @@ public sealed class Gw2ApiClientTests
         });
         return Inventory(bags.ToArray());
     }
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_uses_exact_authenticated_route_scopes_and_preserves_source_order_without_order_ids()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec("""[{"id":901,"item_id":20,"price":7,"quantity":251,"created":"2026-01-02T03:04:05Z","future":true},{"id":902,"item_id":10,"price":5,"quantity":4,"created":"2026-01-03T03:04:05Z"}]""", Headers: CurrentBuyHeaders("2", "2", "2", "4")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test")).GetCurrentBuysPageAsync(1, 2, CancellationToken.None);
+
+        Assert.Equal((1, 2, 2, 4L), (result.Page, result.PageSize, result.PageCount, result.TotalCount));
+        Assert.Equal([(20L, 7L, 251L), (10L, 5L, 4L)], result.Orders.Select(order => (order.ItemId, order.Price, order.Quantity)));
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/commerce/transactions/current/buys?page=1&page_size=2&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, header => Assert.Equal("Bearer " + apiKey, header));
+    }
+
+    [Theory]
+    [InlineData(-1, 50)]
+    [InlineData(0, 0)]
+    [InlineData(0, 201)]
+    public async Task GetCurrentBuysPageAsync_validates_bounds_before_authentication(int page, int pageSize)
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(page, pageSize, CancellationToken.None));
+
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_accepts_only_the_explicit_empty_shape()
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", new ResponseSpec("[]", Headers: CurrentBuyHeaders("50", "0", "0", "0")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None);
+
+        Assert.Equal((0, 50, 0, 0L), (result.Page, result.PageSize, result.PageCount, result.TotalCount));
+        Assert.Empty(result.Orders);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.PartialContent, "[{")]
+    [InlineData(HttpStatusCode.NoContent, "[]")]
+    public async Task GetCurrentBuysPageAsync_rejects_non_200_statuses_without_private_response_details(HttpStatusCode status, string body)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", new ResponseSpec(body + " private-order-901", status));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.DoesNotContain("private-order", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("{\"X-Page-Size\":\"50\",\"X-Page-Total\":\"1\",\"X-Result-Count\":\"1\"}", "[]")]
+    [InlineData("{\"X-Page-Size\":\"50\",\"X-Page-Total\":\"1\",\"X-Result-Count\":\"2\",\"X-Result-Total\":\"1\"}", "[]")]
+    public async Task GetCurrentBuysPageAsync_rejects_pagination_contradictions(string headersJson, string body)
+    {
+        var headers = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, string>>(headersJson)!;
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", new ResponseSpec(body, Headers: headers));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains("pagination", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_rejects_locally_valid_page_when_metadata_proves_it_out_of_range()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec("private-current-buy-body", Headers: CurrentBuyHeaders("50", "1", "1", "1")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(1, 50, CancellationToken.None));
+
+        Assert.Contains("pagination", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-current-buy-body", error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/commerce/transactions/current/buys?page=1&page_size=50&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("[{\"id\":1,\"item_id\":1,\"price\":1,\"quantity\":1,\"created\":\"2026-01-01T00:00:00Z\"},{\"id\":1,\"item_id\":2,\"price\":1,\"quantity\":1,\"created\":\"2026-01-01T00:00:00Z\"}]")]
+    [InlineData("[{\"id\":1,\"item_id\":0,\"price\":1,\"quantity\":1,\"created\":\"2026-01-01T00:00:00Z\"}]")]
+    [InlineData("[{\"id\":1,\"item_id\":1,\"price\":1,\"quantity\":1,\"created\":null}]")]
+    public async Task GetCurrentBuysPageAsync_rejects_duplicate_or_invalid_rows(string body)
+    {
+        var count = body.Count(character => character == '{');
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", new ResponseSpec(body, Headers: CurrentBuyHeaders("50", "1", count.ToString(), count.ToString())));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_retries_transient_response_once_and_redacts_auth_failure()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec("[]", Headers: CurrentBuyHeaders("50", "0", "0", "0")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None);
+
+        Assert.Empty(result.Orders);
+        Assert.Equal(3, handler.RequestUris.Count);
+
+        var authHandler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", new ResponseSpec("Permission denied private-901", HttpStatusCode.Forbidden));
+        using var authClient = new HttpClient(authHandler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(authClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+        Assert.Equal(2, authHandler.RequestUris.Count);
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-901", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_rejects_advertised_or_streamed_over_bound_body_and_disposes_failed_classification_response()
+    {
+        var oversized = new string('x', 256 * 1024 + 1);
+        var content = new ThrowingTrackedHttpContent();
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(oversized) });
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        var classificationHandler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = content });
+        using var classificationClient = new HttpClient(classificationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<HttpRequestException>(() => new Gw2ApiClient(classificationClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+        Assert.True(content.IsDisposed);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_normalizes_private_mid_body_read_failures()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new MidBodyIOExceptionContent() };
+        foreach (var (name, value) in CurrentBuyHeaders("50", "1", "1", "1")) response.Headers.TryAddWithoutValidation(name, value);
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains("invalid current-buys response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-mid-body-marker", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_normalizes_private_permission_body_read_failures()
+    {
+        var content = new MidBodyIOExceptionContent();
+        var handler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.OK) { Content = content });
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains("invalid current-buys response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-mid-body-marker", error.Message, StringComparison.Ordinal);
+        Assert.True(content.IsDisposed);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_normalizes_private_auth_classification_body_read_failures()
+    {
+        var content = new MidBodyIOExceptionContent();
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = content });
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains("invalid current-buys response", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-mid-body-marker", error.Message, StringComparison.Ordinal);
+        Assert.True(content.IsDisposed);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_accepts_exact_decoded_body_limit_with_additive_padding()
+    {
+        var body = CurrentBuyPayloadAtBytes(256 * 1024);
+        Assert.Equal(256 * 1024, Encoding.UTF8.GetByteCount(body));
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec(body, Headers: CurrentBuyHeaders("50", "1", "1", "1")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None);
+
+        Assert.Equal((1, 1L), (result.Orders.Count, result.TotalCount));
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_rejects_streamed_body_over_limit_without_content_length()
+    {
+        var content = new StreamingBytesContent(Encoding.UTF8.GetBytes(new string('x', 256 * 1024 + 1)));
+        Assert.Null(content.Headers.ContentLength);
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        foreach (var (name, value) in CurrentBuyHeaders("50", "1", "1", "1")) response.Headers.TryAddWithoutValidation(name, value);
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains("invalid current-buys response", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_missing_key_stops_before_tokeninfo_or_transaction()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("{\"permissions\":[\"tradingpost\"]}", "account")]
+    [InlineData("{\"permissions\":[\"account\"]}", "tradingpost")]
+    public async Task GetCurrentBuysPageAsync_requires_each_permission_before_transaction(string tokenInfo, string missingPermission)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(tokenInfo);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.Contains(missingPermission + " permission", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_retries_transient_invalid_key_marker_once_without_exposing_body()
+    {
+        var handler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec("Invalid key private-marker-901", HttpStatusCode.Unauthorized),
+            new ResponseSpec("[]", Headers: CurrentBuyHeaders("50", "0", "0", "0")));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None);
+
+        Assert.Empty(result.Orders);
+        Assert.Equal(3, handler.RequestUris.Count);
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.Contains("/v2/commerce/transactions/current/buys", StringComparison.Ordinal)));
+        Assert.DoesNotContain("private-marker-901", System.Text.Json.JsonSerializer.Serialize(result), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_owned_timeout_covers_stalled_request_before_response_headers()
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var handler = new StallingCurrentBuysRequestHandler(timeProvider);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"), timeProvider).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+
+        Assert.True(timeProvider.Fired);
+        Assert.Equal(2, handler.RequestCount);
+        Assert.Contains("timed out", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_enforces_row_cap_and_owned_body_timeout_while_preserving_caller_cancellation()
+    {
+        var atBoundHandler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec(CurrentBuyBody(200), Headers: CurrentBuyHeaders("200", "1", "200", "200")));
+        using var atBoundClient = new HttpClient(atBoundHandler) { BaseAddress = new Uri("https://example.test") };
+        var atBound = await new Gw2ApiClient(atBoundClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 200, CancellationToken.None);
+        Assert.Equal(200, atBound.Orders.Count);
+
+        var overBoundHandler = new RecordingHandler(
+            """{"permissions":["account","tradingpost"]}""",
+            new ResponseSpec(CurrentBuyBody(201), Headers: CurrentBuyHeaders("200", "1", "200", "200")));
+        using var overBoundClient = new HttpClient(overBoundHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(overBoundClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 200, CancellationToken.None));
+
+        var timeoutProvider = new DeferredTimerTimeProvider();
+        var timeoutResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(timeoutProvider) };
+        foreach (var (name, value) in CurrentBuyHeaders("50", "0", "0", "0")) timeoutResponse.Headers.TryAddWithoutValidation(name, value);
+        var timeoutHandler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", timeoutResponse);
+        using var timeoutClient = new HttpClient(timeoutHandler) { BaseAddress = new Uri("https://example.test") };
+        var timeoutError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(timeoutClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"), timeoutProvider).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+        Assert.True(timeoutProvider.Fired);
+        Assert.Contains("timed out", timeoutError.Message, StringComparison.OrdinalIgnoreCase);
+
+        using var cancellation = new CancellationTokenSource();
+        var cancellationHandler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""") { OnRequest = cancellation.Cancel };
+        using var cancellationClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(cancellationClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, cancellation.Token));
+    }
+
+    [Fact]
+    public async Task GetCurrentBuysPageAsync_rejects_repeated_pagination_header_values()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("[]") };
+        response.Headers.TryAddWithoutValidation("X-Page-Size", "50");
+        response.Headers.TryAddWithoutValidation("X-Page-Size", "50");
+        response.Headers.TryAddWithoutValidation("X-Page-Total", "0");
+        response.Headers.TryAddWithoutValidation("X-Result-Count", "0");
+        response.Headers.TryAddWithoutValidation("X-Result-Total", "0");
+        var handler = new RecordingHandler("""{"permissions":["account","tradingpost"]}""", response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetCurrentBuysPageAsync(0, 50, CancellationToken.None));
+    }
+
+    private static Dictionary<string, string> CurrentBuyHeaders(string pageSize, string pageTotal, string resultCount, string resultTotal) => new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["X-Page-Size"] = pageSize,
+        ["X-Page-Total"] = pageTotal,
+        ["X-Result-Count"] = resultCount,
+        ["X-Result-Total"] = resultTotal
+    };
+
+    private static string CurrentBuyBody(int count) => "[" + string.Join(',', Enumerable.Range(1, count).Select(id => "{\"id\":" + id + ",\"item_id\":" + id + ",\"price\":1,\"quantity\":1,\"created\":\"2026-01-01T00:00:00Z\"}")) + "]";
+
+    private static string CurrentBuyPayloadAtBytes(int targetBytes)
+    {
+        const string prefix = "[{\"id\":1,\"item_id\":1,\"price\":1,\"quantity\":1,\"created\":\"2026-01-01T00:00:00Z\",\"padding\":\"";
+        const string suffix = "\"}]";
+        return prefix + new string('x', targetBytes - Encoding.UTF8.GetByteCount(prefix + suffix)) + suffix;
+    }
+
     private static string MetadataInventoryPayload() => Inventory("{\"id\":10,\"size\":2,\"inventory\":[{\"id\":1,\"count\":1},{\"id\":2,\"count\":1}]}");
     private static string ItemMetadata(IEnumerable<long> ids) => "[" + string.Join(',', ids.Select(id => id <= 201
         ? "{\"id\":" + id + ",\"name\":\"Item " + id + "\",\"type\":\"Weapon\",\"rarity\":\"Rare\",\"level\":80}"
@@ -3485,6 +3820,63 @@ public sealed class Gw2ApiClientTests
         }
     }
 
+    private sealed class MidBodyIOExceptionContent : HttpContent
+    {
+        public bool IsDisposed { get; private set; }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => throw new NotSupportedException();
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new MidBodyIOExceptionStream());
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class StreamingBytesContent(byte[] bytes) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => stream.WriteAsync(bytes).AsTask();
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new MemoryStream(bytes, writable: false));
+    }
+
+    private sealed class MidBodyIOExceptionStream : Stream
+    {
+        private static readonly byte[] InitialBytes = Encoding.UTF8.GetBytes("[");
+        private bool firstRead = true;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            if (!firstRead) throw new IOException("private-mid-body-marker");
+            firstRead = false;
+            InitialBytes.CopyTo(buffer);
+            return ValueTask.FromResult(InitialBytes.Length);
+        }
+    }
+
     private sealed class StallingReadStream(DeferredTimerTimeProvider timeProvider) : Stream
     {
         public override bool CanRead => true;
@@ -3524,6 +3916,27 @@ public sealed class Gw2ApiClientTests
             timeProvider.Fire();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             throw new InvalidOperationException("The timed request unexpectedly completed.");
+        }
+    }
+
+    private sealed class StallingCurrentBuysRequestHandler(DeferredTimerTimeProvider timeProvider) : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            if (RequestCount == 1)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"permissions":["account","tradingpost"]}""", Encoding.UTF8, "application/json")
+                };
+            }
+
+            timeProvider.Fire();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("The timed current-buys request unexpectedly completed.");
         }
     }
 

@@ -450,6 +450,7 @@ public sealed class GetAccountHoldingsTests
         public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) => Complete("bags", CharacterBags, CharacterError);
         public Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken) => Complete("delivery", Delivery, DeliveryError);
         public Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken) => Complete("sells", CurrentSells, SellsError);
+        public Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) => Complete("items", Items, ItemsError);
         public Task<Gw2PublicItems> GetPublicItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2MaterialCategories> GetPublicMaterialCategoriesAsync(CancellationToken cancellationToken) => throw new NotSupportedException();

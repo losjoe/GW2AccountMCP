@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -18,6 +19,7 @@ public interface IGw2ApiClient
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
     Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken);
+    Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken);
     Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
     Task<Gw2PublicItems> GetPublicItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
     Task<Gw2MaterialCategories> GetPublicMaterialCategoriesAsync(CancellationToken cancellationToken);
@@ -33,6 +35,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     public const string SchemaVersion = "2025-08-29T01:00:00.000Z";
     private const string Language = "en";
     private const int CurrentSellsPageSize = 200;
+    private const int MaximumCurrentBuysPageSize = 200;
+    private const int MaximumCurrentBuysPayloadBytes = 256 * 1024;
     private const int MaximumItemBatchSize = 200;
     private const int MaximumPublicItemBatchSize = 100;
     private const int MaximumMaterialCategoryPayloadBytes = 128 * 1024;
@@ -561,6 +565,39 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             {
                 return new Gw2CurrentSells(orders);
             }
+        }
+    }
+
+    public async Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken)
+    {
+        if (page < 0) throw new ArgumentOutOfRangeException(nameof(page), "Page must be nonnegative.");
+        if (pageSize is < 1 or > MaximumCurrentBuysPageSize) throw new ArgumentOutOfRangeException(nameof(pageSize), "Page size must be from 1 through 200.");
+        if (string.IsNullOrWhiteSpace(options.ApiKey)) throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+
+        try
+        {
+            await ValidatePermissionsAsync(["account", "tradingpost"], cancellationToken);
+            using var request = await SendCurrentBuysWithSingleRetryAsync(
+                $"/v2/commerce/transactions/current/buys?page={page}&page_size={pageSize}", cancellationToken);
+            var response = request.Response;
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
+            if (response.StatusCode != HttpStatusCode.OK)
+            {
+                throw new Gw2ConfigurationException($"GW2 current-buys request failed with HTTP {(int)response.StatusCode}. Try again later.");
+            }
+
+            var pagination = DeserializeCurrentBuysPagination(response.Headers, page, pageSize);
+            var orders = await DeserializeCurrentBuysAsync(response, request.CancellationToken);
+            if (orders.Count != pagination.ResultCount) throw InvalidCurrentBuysPagination();
+            return new Gw2CurrentBuysPage(page, pageSize, pagination.PageCount, pagination.TotalCount, orders);
+        }
+        catch (IOException)
+        {
+            throw InvalidCurrentBuysResponse();
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            throw new Gw2ConfigurationException("GW2 current-buys request timed out. Try again later.");
         }
     }
 
@@ -1501,6 +1538,106 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return value;
     }
 
+    private static CurrentBuysPagination DeserializeCurrentBuysPagination(HttpResponseHeaders headers, int requestedPage, int requestedPageSize)
+    {
+        var pageSize = ParseCurrentBuysPaginationHeader(headers, "X-Page-Size");
+        var pageCount = ParseCurrentBuysPaginationHeader(headers, "X-Page-Total");
+        var resultCount = ParseCurrentBuysPaginationHeader(headers, "X-Result-Count");
+        var totalCount = ParseCurrentBuysPaginationHeader(headers, "X-Result-Total");
+        if (pageSize != requestedPageSize
+            || pageCount > int.MaxValue
+            || resultCount > MaximumCurrentBuysPageSize
+            || (totalCount == 0 && (requestedPage != 0 || pageCount != 0 || resultCount != 0))
+            || (totalCount > 0 && (pageCount == 0 || requestedPage >= pageCount
+                || pageCount != checked(((totalCount - 1) / pageSize) + 1)
+                || resultCount != (requestedPage == pageCount - 1
+                    ? totalCount - ((pageCount - 1) * pageSize)
+                    : pageSize))))
+        {
+            throw InvalidCurrentBuysPagination();
+        }
+
+        return new CurrentBuysPagination((int)pageCount, (int)resultCount, totalCount);
+    }
+
+    private static long ParseCurrentBuysPaginationHeader(HttpResponseHeaders headers, string name)
+    {
+        if (!headers.TryGetValues(name, out var values)) throw InvalidCurrentBuysPagination();
+        var valueArray = values.ToArray();
+        if (valueArray.Length != 1
+            || !long.TryParse(valueArray[0], NumberStyles.None, CultureInfo.InvariantCulture, out var value)
+            || value < 0)
+        {
+            throw InvalidCurrentBuysPagination();
+        }
+
+        return value;
+    }
+
+    private async Task<IReadOnlyList<Gw2CurrentBuyOrder>> DeserializeCurrentBuysAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var body = await ReadCurrentBuysBodyAsync(response.Content, cancellationToken);
+            await using var stream = new MemoryStream(body, writable: false);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() > MaximumCurrentBuysPageSize) throw InvalidCurrentBuysResponse();
+
+            var ids = new HashSet<long>();
+            var orders = new List<Gw2CurrentBuyOrder>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object) throw InvalidCurrentBuysResponse();
+                var id = CurrentBuyLong(element, "id");
+                var itemId = CurrentBuyLong(element, "item_id");
+                var price = CurrentBuyLong(element, "price");
+                var quantity = CurrentBuyLong(element, "quantity");
+                var created = CurrentBuyDateTimeOffset(element, "created");
+                if (id <= 0 || itemId <= 0 || price <= 0 || quantity <= 0 || created == default || !ids.Add(id)) throw InvalidCurrentBuysResponse();
+                orders.Add(new Gw2CurrentBuyOrder(itemId, price, quantity, created));
+            }
+
+            return orders;
+        }
+        catch (JsonException)
+        {
+            throw InvalidCurrentBuysResponse();
+        }
+        catch (IOException)
+        {
+            throw InvalidCurrentBuysResponse();
+        }
+    }
+
+    private static long CurrentBuyLong(JsonElement element, string name)
+    {
+        var values = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (values.Length != 1 || values[0].Value.ValueKind != JsonValueKind.Number || !values[0].Value.TryGetInt64(out var value)) throw InvalidCurrentBuysResponse();
+        return value;
+    }
+
+    private static DateTimeOffset CurrentBuyDateTimeOffset(JsonElement element, string name)
+    {
+        var values = element.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (values.Length != 1 || values[0].Value.ValueKind != JsonValueKind.String || !values[0].Value.TryGetDateTimeOffset(out var value)) throw InvalidCurrentBuysResponse();
+        return value;
+    }
+
+    private static async Task<byte[]> ReadCurrentBuysBodyAsync(HttpContent content, CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is > MaximumCurrentBuysPayloadBytes) throw InvalidCurrentBuysResponse();
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken);
+        await using var buffer = new MemoryStream();
+        var chunk = new byte[8192];
+        while (true)
+        {
+            var read = await stream.ReadAsync(chunk, cancellationToken);
+            if (read == 0) return buffer.ToArray();
+            if (buffer.Length > MaximumCurrentBuysPayloadBytes - read) throw InvalidCurrentBuysResponse();
+            await buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken);
+        }
+    }
+
     private async Task<List<CurrentSellResponse>> DeserializeCurrentSellsAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         try
@@ -2371,6 +2508,12 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return body.Contains("invalid key", StringComparison.OrdinalIgnoreCase);
     }
 
+    private async Task<bool> IsCurrentBuysInvalidKeyResponseAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        var body = await ReadCurrentBuysBodyAsync(response.Content, cancellationToken);
+        return Encoding.UTF8.GetString(body).Contains("invalid key", StringComparison.OrdinalIgnoreCase);
+    }
+
     private async Task<TimedHttpResponse> SendRecipeWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated)
     {
         for (var attempt = 0; ; attempt++)
@@ -2397,6 +2540,54 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
                 isInvalidKey = authenticated
                     && response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
                     && await IsInvalidKeyResponseAsync(response, linkedSource.Token);
+            }
+            catch
+            {
+                response.Dispose();
+                linkedSource.Dispose();
+                timeoutSource.Dispose();
+                throw;
+            }
+
+            if (attempt == 0 && (isTransient || isInvalidKey))
+            {
+                var retryDelay = isTransient ? GetRetryDelay(response) : TimeSpan.Zero;
+                response.Dispose();
+                linkedSource.Dispose();
+                timeoutSource.Dispose();
+                await Task.Delay(retryDelay, timeProvider ?? TimeProvider.System, cancellationToken);
+                continue;
+            }
+
+            return new TimedHttpResponse(response, timeoutSource, linkedSource);
+        }
+    }
+
+    private async Task<TimedHttpResponse> SendCurrentBuysWithSingleRetryAsync(string path, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var timeoutSource = new CancellationTokenSource(RecipeAttemptTimeout, timeProvider ?? TimeProvider.System);
+            var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendAsync(path, linkedSource.Token, authenticated: true);
+            }
+            catch
+            {
+                linkedSource.Dispose();
+                timeoutSource.Dispose();
+                throw;
+            }
+
+            bool isTransient;
+            bool isInvalidKey;
+            try
+            {
+                isTransient = response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout;
+                isInvalidKey = response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                    && await IsCurrentBuysInvalidKeyResponseAsync(response, linkedSource.Token);
             }
             catch
             {
@@ -2498,6 +2689,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidTradingPostDeliveryResponse() => new("GW2 returned an invalid delivery response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsResponse() => new("GW2 returned an invalid current-sells response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
+    private static Gw2ConfigurationException InvalidCurrentBuysResponse() => new("GW2 returned an invalid current-buys response. Try again later.");
+    private static Gw2ConfigurationException InvalidCurrentBuysPagination() => new("GW2 returned invalid current-buys pagination metadata. Try again later.");
     private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
     private static Gw2ConfigurationException InvalidPublicItemResponse() => new("GW2 returned an invalid public item response. Try again later.");
     private static Gw2ConfigurationException InvalidPublicMaterialCategoryResponse() => new("GW2 returned an invalid public material-category response. Try again later.");
@@ -2565,6 +2758,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         long? Quantity,
         DateTimeOffset? Created);
     private sealed record CurrentSellsPagination(long PageSize, int PageTotal, long ResultCount, long ResultTotal);
+    private sealed record CurrentBuysPagination(int PageCount, int ResultCount, long TotalCount);
     private sealed record ItemResponse(long? Id, string? Name);
     private sealed record LegendaryArmoryOwnership(long Id, long Count);
     private sealed record LegendaryArmoryItemMetadata(long Id, string Name, string Type, string? Subtype, string? WeightClass);
@@ -2679,6 +2873,8 @@ public sealed record Gw2TradingPostDelivery(long Coins, IReadOnlyList<Gw2Trading
 public sealed record Gw2TradingPostDeliveryItem(long Id, long Count);
 public sealed record Gw2CurrentSells(IReadOnlyList<Gw2CurrentSellOrder> Orders);
 public sealed record Gw2CurrentSellOrder(long Id, long ItemId, long Price, long Quantity, DateTimeOffset Created);
+public sealed record Gw2CurrentBuysPage(int Page, int PageSize, int PageCount, long TotalCount, IReadOnlyList<Gw2CurrentBuyOrder> Orders);
+public sealed record Gw2CurrentBuyOrder(long ItemId, long Price, long Quantity, DateTimeOffset Created);
 public sealed record Gw2Items(IReadOnlyList<Gw2Item> Items, IReadOnlyList<long> MissingItemIds);
 public sealed record Gw2Item(long Id, string Name);
 public sealed record Gw2PublicItems(IReadOnlyList<Gw2PublicItem> Items, IReadOnlyList<long> MissingItemIds, IReadOnlyList<string> Warnings);

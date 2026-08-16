@@ -43,6 +43,7 @@ builder.Services
     .WithTools<ValueItemsTool>()
     .WithTools<GetAccountTool>()
     .WithTools<GetAccountHoldingsTool>()
+    .WithTools<GetTradingPostActivityTool>()
     .WithTools<GetLegendaryArmoryTool>()
     .WithTools<GetCharacterBuildTool>()
     .WithTools<GetCharacterEquipmentTool>()
