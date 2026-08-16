@@ -30,7 +30,7 @@ public sealed class GetRecipesToolTests
         };
         var tool = new GetRecipesTool(client, new FixedTimeProvider());
 
-        var result = await tool.GetRecipesAsync("ByIds", [1, 2], null, null, null, CancellationToken.None);
+        var result = await tool.GetRecipesAsync("ByIds", [1, 2], cancellationToken: CancellationToken.None);
 
         Assert.Equal("ByIds", result.Mode);
         Assert.Equal([1L, 2L], result.Recipes.Select(recipe => recipe.Id));
@@ -44,8 +44,66 @@ public sealed class GetRecipesToolTests
         Assert.Null(result.SelectorAsOf);
         Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:00Z"), result.RecipesAsOf);
         Assert.Equal(result.RecipesAsOf, result.AsOf);
+        Assert.Null(result.AccountUnlocksAsOf);
+        Assert.All(result.Recipes, recipe => Assert.Null(recipe.AccountUnlockListContainsRecipe));
         Assert.False(result.IsAtomicSnapshot);
         Assert.Equal(1, client.DefinitionCalls);
+        Assert.Equal(0, client.AccountUnlockCalls);
+    }
+
+    [Fact]
+    public async Task ByIds_account_annotation_marks_found_and_missing_public_rows_with_distinct_completion_time()
+    {
+        var client = new FakeGw2ApiClient
+        {
+            PublicRecipes = new Gw2PublicRecipes([Recipe(2)], [1]),
+            AccountRecipeUnlocks = new Gw2AccountRecipeUnlocks([1])
+        };
+        var tool = new GetRecipesTool(client, new SequenceTimeProvider(
+            DateTimeOffset.Parse("2026-08-16T12:00:00Z"),
+            DateTimeOffset.Parse("2026-08-16T12:00:01Z")));
+
+        var result = await tool.GetRecipesAsync("ByIds", [1, 2], null, null, null, true, CancellationToken.None);
+
+        Assert.Equal([true, false], result.Recipes.Select(recipe => recipe.AccountUnlockListContainsRecipe));
+        Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:00Z"), result.RecipesAsOf);
+        Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:01Z"), result.AccountUnlocksAsOf);
+        Assert.Equal(result.AccountUnlocksAsOf, result.AsOf);
+        Assert.Equal(1, client.AccountUnlockCalls);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData(false)]
+    public async Task Null_or_false_account_annotation_preserves_public_only_behavior(bool? includeAccountUnlocks)
+    {
+        var client = new FakeGw2ApiClient { PublicRecipes = new Gw2PublicRecipes([Recipe(1)], []) };
+
+        var result = await new GetRecipesTool(client, new FixedTimeProvider()).GetRecipesAsync(
+            "ByIds", [1], null, null, null, includeAccountUnlocks, CancellationToken.None);
+
+        Assert.Null(result.AccountUnlocksAsOf);
+        Assert.Null(Assert.Single(result.Recipes).AccountUnlockListContainsRecipe);
+        Assert.Equal(result.RecipesAsOf, result.AsOf);
+        Assert.Equal(0, client.AccountUnlockCalls);
+    }
+
+    [Fact]
+    public async Task Complete_empty_account_list_marks_every_requested_recipe_false()
+    {
+        var client = new FakeGw2ApiClient
+        {
+            PublicRecipes = new Gw2PublicRecipes([Recipe(1)], [2]),
+            AccountRecipeUnlocks = new Gw2AccountRecipeUnlocks([])
+        };
+
+        var result = await new GetRecipesTool(client, new SequenceTimeProvider(
+                DateTimeOffset.Parse("2026-08-16T12:00:00Z"),
+                DateTimeOffset.Parse("2026-08-16T12:00:01Z")))
+            .GetRecipesAsync("ByIds", [1, 2], null, null, null, true, CancellationToken.None);
+
+        Assert.Equal([false, false], result.Recipes.Select(recipe => recipe.AccountUnlockListContainsRecipe));
+        Assert.NotNull(result.AccountUnlocksAsOf);
     }
 
     [Fact]
@@ -65,7 +123,7 @@ public sealed class GetRecipesToolTests
             DateTimeOffset.Parse("2026-08-16T12:00:00Z"),
             DateTimeOffset.Parse("2026-08-16T12:00:01Z")));
 
-        var result = await tool.GetRecipesAsync("InputItem", null, 10, 1, 2, CancellationToken.None);
+        var result = await tool.GetRecipesAsync("InputItem", null, 10, 1, 2, null, CancellationToken.None);
 
         Assert.Equal([2L, 3L], result.Recipes.Select(recipe => recipe.Id));
         Assert.Equal([2L, 3L], client.DefinitionRequest);
@@ -90,7 +148,7 @@ public sealed class GetRecipesToolTests
         var client = new FakeGw2ApiClient { InputSelector = new Gw2RecipeSelector([1, 2]) };
         var tool = new GetRecipesTool(client, new FixedTimeProvider());
 
-        var result = await tool.GetRecipesAsync("InputItem", null, 10, 10, null, CancellationToken.None);
+        var result = await tool.GetRecipesAsync("InputItem", null, 10, 10, null, null, CancellationToken.None);
 
         Assert.Empty(result.Recipes);
         Assert.Equal(2, result.TotalMatches);
@@ -98,6 +156,28 @@ public sealed class GetRecipesToolTests
         Assert.False(result.HasMore);
         Assert.Equal(result.SelectorAsOf, result.RecipesAsOf);
         Assert.Equal(0, client.DefinitionCalls);
+    }
+
+    [Fact]
+    public async Task Selector_empty_page_still_performs_explicit_account_annotation()
+    {
+        var client = new FakeGw2ApiClient
+        {
+            InputSelector = new Gw2RecipeSelector([1]),
+            AccountRecipeUnlocks = new Gw2AccountRecipeUnlocks([])
+        };
+
+        var result = await new GetRecipesTool(client, new SequenceTimeProvider(
+                DateTimeOffset.Parse("2026-08-16T12:00:00Z"),
+                DateTimeOffset.Parse("2026-08-16T12:00:01Z")))
+            .GetRecipesAsync("InputItem", null, 10, 10, null, true, CancellationToken.None);
+
+        Assert.Empty(result.Recipes);
+        Assert.Equal(result.SelectorAsOf, result.RecipesAsOf);
+        Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:01Z"), result.AccountUnlocksAsOf);
+        Assert.Equal(result.AccountUnlocksAsOf, result.AsOf);
+        Assert.Equal(0, client.DefinitionCalls);
+        Assert.Equal(1, client.AccountUnlockCalls);
     }
 
     [Fact]
@@ -126,7 +206,7 @@ public sealed class GetRecipesToolTests
         var result = await new GetRecipesTool(client, new SequenceTimeProvider(
                 DateTimeOffset.Parse("2026-08-16T12:00:00Z"),
                 DateTimeOffset.Parse("2026-08-16T12:00:01Z")))
-            .GetRecipesAsync("OutputItem", null, 999, null, null, CancellationToken.None);
+            .GetRecipesAsync("OutputItem", null, 999, null, null, null, CancellationToken.None);
 
         var recipe = Assert.Single(result.Recipes);
         var output = Assert.IsType<RecipeOutputResult>(recipe.Output);
@@ -174,12 +254,14 @@ public sealed class GetRecipesToolTests
                 invalid.ItemId,
                 invalid.Offset,
                 invalid.Limit,
+                true,
                 CancellationToken.None));
         }
 
         Assert.Equal(0, client.DefinitionCalls);
         Assert.Equal(0, client.InputSelectorCalls);
         Assert.Equal(0, client.OutputSelectorCalls);
+        Assert.Equal(0, client.AccountUnlockCalls);
     }
 
     [Fact]
@@ -187,7 +269,7 @@ public sealed class GetRecipesToolTests
     {
         var unavailable = new FakeGw2ApiClient { DefinitionError = new IOException("private recipe body") };
         var error = await Assert.ThrowsAsync<McpException>(() =>
-            new GetRecipesTool(unavailable, TimeProvider.System).GetRecipesAsync("ByIds", [1], null, null, null, CancellationToken.None));
+            new GetRecipesTool(unavailable, TimeProvider.System).GetRecipesAsync("ByIds", [1], null, null, null, null, CancellationToken.None));
         Assert.Contains("recipe facts are unavailable", error.Message, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
 
@@ -195,7 +277,33 @@ public sealed class GetRecipesToolTests
         cancellationSource.Cancel();
         var cancelled = new FakeGw2ApiClient { InputSelectorError = new OperationCanceledException(cancellationSource.Token) };
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
-            new GetRecipesTool(cancelled, TimeProvider.System).GetRecipesAsync("InputItem", null, 1, null, null, cancellationSource.Token));
+            new GetRecipesTool(cancelled, TimeProvider.System).GetRecipesAsync("InputItem", null, 1, null, null, null, cancellationSource.Token));
+    }
+
+    [Fact]
+    public async Task Explicit_account_failure_is_total_redacted_and_preserves_caller_cancellation()
+    {
+        var unavailable = new FakeGw2ApiClient
+        {
+            PublicRecipes = new Gw2PublicRecipes([Recipe(1)], []),
+            AccountUnlockError = new IOException("private account recipe body")
+        };
+        var error = await Assert.ThrowsAsync<McpException>(() =>
+            new GetRecipesTool(unavailable, TimeProvider.System)
+                .GetRecipesAsync("ByIds", [1], null, null, null, true, CancellationToken.None));
+        Assert.Contains("account recipe unlocks are unavailable", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private", error.ToString(), StringComparison.OrdinalIgnoreCase);
+
+        using var cancellationSource = new CancellationTokenSource();
+        cancellationSource.Cancel();
+        var cancelled = new FakeGw2ApiClient
+        {
+            PublicRecipes = new Gw2PublicRecipes([Recipe(1)], []),
+            AccountUnlockError = new OperationCanceledException(cancellationSource.Token)
+        };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new GetRecipesTool(cancelled, TimeProvider.System)
+                .GetRecipesAsync("ByIds", [1], null, null, null, true, cancellationSource.Token));
     }
 
     [Fact]
@@ -221,7 +329,7 @@ public sealed class GetRecipesToolTests
         };
 
         var result = await new GetRecipesTool(client, new FixedTimeProvider())
-            .GetRecipesAsync("ByIds", [1], null, null, null, CancellationToken.None);
+            .GetRecipesAsync("ByIds", [1], null, null, null, null, CancellationToken.None);
 
         Assert.Equal(16, result.Warnings.Count);
         Assert.Contains("Future1", result.Warnings[0], StringComparison.Ordinal);
@@ -233,13 +341,16 @@ public sealed class GetRecipesToolTests
         public int DefinitionCalls { get; private set; }
         public int InputSelectorCalls { get; private set; }
         public int OutputSelectorCalls { get; private set; }
+        public int AccountUnlockCalls { get; private set; }
         public IReadOnlyList<long>? DefinitionRequest { get; private set; }
         public Gw2PublicRecipes PublicRecipes { get; set; } = new([], []);
         public Gw2RecipeSelector InputSelector { get; set; } = new([]);
         public Gw2RecipeSelector OutputSelector { get; set; } = new([]);
+        public Gw2AccountRecipeUnlocks AccountRecipeUnlocks { get; set; } = new([]);
         public Exception? DefinitionError { get; set; }
         public Exception? InputSelectorError { get; set; }
         public Exception? OutputSelectorError { get; set; }
+        public Exception? AccountUnlockError { get; set; }
 
         public Task<Gw2PublicRecipes> GetPublicRecipesAsync(IReadOnlyList<long> recipeIds, CancellationToken cancellationToken)
         {
@@ -264,6 +375,13 @@ public sealed class GetRecipesToolTests
             return OutputSelectorError is null
                 ? Task.FromResult(OutputSelector)
                 : Task.FromException<Gw2RecipeSelector>(OutputSelectorError);
+        }
+        public Task<Gw2AccountRecipeUnlocks> GetAccountRecipeUnlocksAsync(CancellationToken cancellationToken)
+        {
+            AccountUnlockCalls++;
+            return AccountUnlockError is null
+                ? Task.FromResult(AccountRecipeUnlocks)
+                : Task.FromException<Gw2AccountRecipeUnlocks>(AccountUnlockError);
         }
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) => throw new NotSupportedException();

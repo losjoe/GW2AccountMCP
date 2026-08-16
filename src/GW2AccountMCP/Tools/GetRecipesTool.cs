@@ -14,20 +14,21 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
     private const int DefaultLimit = 50;
     private const int MaximumLimit = 100;
     private const int MaximumWarnings = 16;
-    private const string SourceStatement = "Public request-time Guild Wars 2 recipe observations; not a source publication or currentness guarantee.";
-    private const string ScopeStatement = "Player-discovered crafting recipes only; excludes Mystic Forge, vendor, achievement, acquisition-route, price, cost, and recommendation behavior.";
+    private const string SourceStatement = "Public request-time Guild Wars 2 recipe observations with optional authenticated account recipe-unlock list membership; source times are separate observations, not one atomic snapshot or currentness guarantee.";
+    private const string ScopeStatement = "Player-discovered crafting recipes only; account membership means only presence in the accepted complete unlock list, and absence does not mean the recipe cannot be crafted. Excludes Mystic Forge, vendor, achievement, acquisition-route, price, cost, and recommendation behavior.";
     private const string InputSelectorStatement = "The input selector indexes Item ingredients only; Currency and GuildUpgrade ingredients are not selector matches.";
     private const string OutputSelectorStatement = "The output selector matches raw source output_item_id values, which can be bogus for guild recipes and must not be treated as their semantic Item output; those recipes use GuildUpgrade semantics.";
     private static readonly HashSet<string> KnownIngredientKinds = ["Item", "Currency", "GuildUpgrade"];
 
     [McpServerTool(Name = "get_recipes", Title = "Get recipes", ReadOnly = true, Idempotent = true, OpenWorld = false, UseStructuredContent = true)]
-    [Description("Returns bounded public Guild Wars 2 player-discovered crafting recipe facts by recipe IDs or by an input/output item selector. It does not use credentials, account unlocks, caches, prices, costs, or recommendations.")]
+    [Description("Returns bounded public Guild Wars 2 player-discovered crafting recipe facts by recipe IDs or by an input/output item selector. Optional account-unlock annotation requires account and unlocks permissions, is a non-atomic list-membership join, and does not imply craftability. It does not use caches, prices, costs, or recommendations.")]
     public async Task<GetRecipesResult> GetRecipesAsync(
         [Description("Required mode: ByIds, InputItem, or OutputItem.")] string? mode,
         [Description("Required only for ByIds: 1 through 100 distinct positive canonical recipe IDs.")] IReadOnlyList<long>? recipeIds = null,
         [Description("Required only for InputItem or OutputItem: one positive canonical item ID.")] long? itemId = null,
         [Description("Optional only for selector modes: local sorted-result offset from 0 through 4999. Omitted or null means 0.")] int? offset = null,
         [Description("Optional only for selector modes: local page size from 1 through 100. Omitted or null means 50.")] int? limit = null,
+        [Description("Optional account recipe-unlock list membership annotation. Omitted, null, or false remains public-only; true requires account and unlocks permissions.")] bool? includeAccountUnlocks = null,
         CancellationToken cancellationToken = default)
     {
         if (mode == "ByIds")
@@ -45,6 +46,7 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
 
             var byIdsRecipes = await GetDefinitionsAsync(recipeIds, cancellationToken).ConfigureAwait(false);
             var byIdsRecipesAsOf = timeProvider.GetUtcNow();
+            var byIdsAccountUnlocks = await GetAccountUnlocksAsync(includeAccountUnlocks == true, cancellationToken).ConfigureAwait(false);
             return BuildResult(
                 mode,
                 recipeIds,
@@ -59,6 +61,8 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
                 null,
                 null,
                 null,
+                byIdsAccountUnlocks.RecipeIds,
+                byIdsAccountUnlocks.AsOf,
                 null);
         }
 
@@ -92,6 +96,7 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
             ? new Gw2PublicRecipes([], [])
             : await GetDefinitionsAsync(selectedIds, cancellationToken).ConfigureAwait(false);
         var recipesAsOf = selectedIds.Length == 0 ? selectorAsOf : timeProvider.GetUtcNow();
+        var accountUnlocks = await GetAccountUnlocksAsync(includeAccountUnlocks == true, cancellationToken).ConfigureAwait(false);
         return BuildResult(
             mode,
             selectedIds,
@@ -106,7 +111,26 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
             effectiveOffset,
             effectiveLimit,
             selectedIds.Length,
+            accountUnlocks.RecipeIds,
+            accountUnlocks.AsOf,
             effectiveOffset + selectedIds.Length < selector.RecipeIds.Count);
+    }
+
+    private async Task<(IReadOnlySet<long>? RecipeIds, DateTimeOffset? AsOf)> GetAccountUnlocksAsync(
+        bool includeAccountUnlocks,
+        CancellationToken cancellationToken)
+    {
+        if (!includeAccountUnlocks) return (null, null);
+        try
+        {
+            var unlocks = await gw2ApiClient.GetAccountRecipeUnlocksAsync(cancellationToken).ConfigureAwait(false);
+            return (unlocks.RecipeIds.ToHashSet(), timeProvider.GetUtcNow());
+        }
+        catch (Gw2ConfigurationException exception) { throw new McpException(exception.Message, exception); }
+        catch (Exception exception) when (exception is HttpRequestException or IOException || exception is OperationCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            throw new McpException("Guild Wars 2 account recipe unlocks are unavailable. Try again later.");
+        }
     }
 
     private async Task<Gw2PublicRecipes> GetDefinitionsAsync(IReadOnlyList<long> recipeIds, CancellationToken cancellationToken)
@@ -136,14 +160,16 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
         int? offset,
         int? limit,
         int? returnedCount,
+        IReadOnlySet<long>? accountUnlockRecipeIds,
+        DateTimeOffset? accountUnlocksAsOf,
         bool? hasMore)
     {
         var recipesById = publicRecipes.Recipes.ToDictionary(recipe => recipe.Id);
         var missingRecipeIds = requestedIds.Where(id => !recipesById.ContainsKey(id)).ToArray();
         var warnings = new List<string>();
         var rows = requestedIds.Select(id => recipesById.TryGetValue(id, out var recipe)
-            ? Found(recipe, warnings)
-            : Missing(id)).ToArray();
+            ? Found(recipe, warnings, accountUnlockRecipeIds?.Contains(id))
+            : Missing(id, accountUnlockRecipeIds?.Contains(id))).ToArray();
         return new GetRecipesResult(
             mode,
             rows,
@@ -152,7 +178,8 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
             mode == "ByIds" ? missingRecipeIds.Length == 0 : areAllRequestedDefinitionsResolved,
             selectorAsOf,
             recipesAsOf,
-            recipesAsOf,
+            accountUnlocksAsOf,
+            accountUnlocksAsOf ?? recipesAsOf,
             false,
             isSelectorComplete,
             isPageComplete,
@@ -168,7 +195,7 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
             ScopeStatement);
     }
 
-    private static PublicRecipeResult Found(Gw2PublicRecipe recipe, List<string> warnings)
+    private static PublicRecipeResult Found(Gw2PublicRecipe recipe, List<string> warnings, bool? accountUnlockListContainsRecipe)
     {
         RecipeOutputResult output;
         if (recipe.OutputUpgradeId is { } outputUpgradeId)
@@ -196,10 +223,11 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
             recipe.Disciplines.Order(StringComparer.Ordinal).ToArray(),
             recipe.Flags.Order(StringComparer.Ordinal).ToArray(),
             recipe.TimeToCraftMs,
-            recipe.Ingredients.Select(ingredient => new RecipeIngredientResult(ingredient.Kind, ingredient.Id, ingredient.Count)).ToArray());
+            recipe.Ingredients.Select(ingredient => new RecipeIngredientResult(ingredient.Kind, ingredient.Id, ingredient.Count)).ToArray(),
+            accountUnlockListContainsRecipe);
     }
 
-    private static PublicRecipeResult Missing(long id) => new(
+    private static PublicRecipeResult Missing(long id, bool? accountUnlockListContainsRecipe) => new(
         "NoPublicRecipeResource",
         id,
         null,
@@ -209,7 +237,8 @@ public sealed class GetRecipesTool(IGw2ApiClient gw2ApiClient, TimeProvider time
         null,
         null,
         null,
-        null);
+        null,
+        accountUnlockListContainsRecipe);
 
     private static McpException InvalidArguments() => new(
         "Use mode ByIds with 1 through 100 distinct positive recipeIds only, or mode InputItem/OutputItem with one positive itemId and optional offset 0 through 4999 and limit 1 through 100.");
@@ -223,6 +252,7 @@ public sealed record GetRecipesResult(
     [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] bool? AreAllRequestedDefinitionsResolved,
     [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTimeOffset? SelectorAsOf,
     [property: JsonRequired] DateTimeOffset RecipesAsOf,
+    [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] DateTimeOffset? AccountUnlocksAsOf,
     [property: JsonRequired] DateTimeOffset AsOf,
     [property: JsonRequired] bool IsAtomicSnapshot,
     [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] bool? IsSelectorComplete,
@@ -248,7 +278,8 @@ public sealed record PublicRecipeResult(
     [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] IReadOnlyList<string>? Disciplines,
     [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] IReadOnlyList<string>? Flags,
     [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] long? TimeToCraftMs,
-    [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] IReadOnlyList<RecipeIngredientResult>? Ingredients);
+    [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] IReadOnlyList<RecipeIngredientResult>? Ingredients,
+    [property: JsonRequired, JsonIgnore(Condition = JsonIgnoreCondition.Never)] bool? AccountUnlockListContainsRecipe);
 
 public sealed record RecipeOutputResult(
     [property: JsonRequired] string Kind,

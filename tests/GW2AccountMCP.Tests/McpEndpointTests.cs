@@ -52,11 +52,11 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.DoesNotContain("key", items.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", items.GetRawText(), StringComparison.OrdinalIgnoreCase);
         var recipes = toolsByName["get_recipes"];
-        Assert.Equal(["mode", "recipeIds", "itemId", "offset", "limit"], recipes.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["mode", "recipeIds", "itemId", "offset", "limit", "includeAccountUnlocks"], recipes.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
         AssertSchemaRequired(recipes.GetProperty("inputSchema"), "mode");
-        AssertSchemaRequired(recipes.GetProperty("outputSchema"), "mode", "recipes", "resolvedRecipeIds", "missingRecipeIds", "areAllRequestedDefinitionsResolved", "selectorAsOf", "recipesAsOf", "asOf", "isAtomicSnapshot", "isSelectorComplete", "isPageComplete", "areAllSelectedDefinitionsResolved", "totalMatches", "offset", "limit", "returnedCount", "hasMore", "selectorStatement", "warnings", "sourceStatement", "scopeStatement");
+        AssertSchemaRequired(recipes.GetProperty("outputSchema"), "mode", "recipes", "resolvedRecipeIds", "missingRecipeIds", "areAllRequestedDefinitionsResolved", "selectorAsOf", "recipesAsOf", "accountUnlocksAsOf", "asOf", "isAtomicSnapshot", "isSelectorComplete", "isPageComplete", "areAllSelectedDefinitionsResolved", "totalMatches", "offset", "limit", "returnedCount", "hasMore", "selectorStatement", "warnings", "sourceStatement", "scopeStatement");
         var recipeSchema = recipes.GetProperty("outputSchema").GetProperty("properties").GetProperty("recipes").GetProperty("items");
-        AssertSchemaRequired(recipeSchema, "status", "id", "type", "output", "sourceOutputItemId", "minRating", "disciplines", "flags", "timeToCraftMs", "ingredients");
+        AssertSchemaRequired(recipeSchema, "status", "id", "type", "output", "sourceOutputItemId", "minRating", "disciplines", "flags", "timeToCraftMs", "ingredients", "accountUnlockListContainsRecipe");
         AssertSchemaRequired(recipeSchema.GetProperty("properties").GetProperty("output"), "kind", "id", "count");
         AssertSchemaRequired(recipeSchema.GetProperty("properties").GetProperty("ingredients").GetProperty("items"), "kind", "id", "count");
         Assert.DoesNotContain("key", recipes.GetRawText(), StringComparison.OrdinalIgnoreCase);
@@ -296,7 +296,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         using var response = await PostMcpAsync(23, "tools/call", new
         {
             name = "get_recipes",
-            arguments = new { mode = "ByIds", recipeIds = new[] { 999L, 1L }, itemId = (long?)null, offset = (int?)null, limit = (int?)null }
+            arguments = new { mode = "ByIds", recipeIds = new[] { 999L, 1L }, itemId = (long?)null, offset = (int?)null, limit = (int?)null, includeAccountUnlocks = (bool?)null }
         });
         response.EnsureSuccessStatusCode();
         var payload = await ReadMcpResponseAsync(response);
@@ -315,7 +315,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.Equal([999L], structured.GetProperty("missingRecipeIds").EnumerateArray().Select(value => value.GetInt64()));
         Assert.False(structured.GetProperty("areAllRequestedDefinitionsResolved").GetBoolean());
         Assert.Equal(JsonValueKind.Null, structured.GetProperty("selectorAsOf").ValueKind);
+        Assert.Equal(JsonValueKind.Null, structured.GetProperty("accountUnlocksAsOf").ValueKind);
         Assert.Equal(JsonValueKind.Null, structured.GetProperty("isSelectorComplete").ValueKind);
+        Assert.All(rows, row => Assert.Equal(JsonValueKind.Null, row.GetProperty("accountUnlockListContainsRecipe").ValueKind));
         Assert.False(structured.GetProperty("isAtomicSnapshot").GetBoolean());
         Assert.Contains("price", structured.GetProperty("scopeStatement").GetString(), StringComparison.OrdinalIgnoreCase);
     }
@@ -364,6 +366,45 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.Contains("bogus", structured.GetProperty("selectorStatement").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("must not be treated", structured.GetProperty("selectorStatement").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains(structured.GetProperty("warnings").EnumerateArray(), warning => warning.GetString()!.Contains("disclosure-only", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetRecipes_true_account_annotation_serializes_membership_and_account_time()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(26, "tools/call", new
+        {
+            name = "get_recipes",
+            arguments = new { mode = "ByIds", recipeIds = new[] { 999L, 1L }, includeAccountUnlocks = true }
+        });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var rows = structured.GetProperty("recipes").EnumerateArray().ToArray();
+        Assert.True(rows[0].GetProperty("accountUnlockListContainsRecipe").GetBoolean());
+        Assert.False(rows[1].GetProperty("accountUnlockListContainsRecipe").GetBoolean());
+        Assert.Equal("2026-08-12T12:00:00+00:00", structured.GetProperty("accountUnlocksAsOf").GetString());
+        Assert.Equal(structured.GetProperty("accountUnlocksAsOf").GetString(), structured.GetProperty("asOf").GetString());
+        Assert.Contains("absence does not mean", structured.GetProperty("scopeStatement").GetString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetRecipes_true_account_annotation_maps_redacted_total_failure()
+    {
+        using var factory = new AccountRecipeErrorMcpApplicationFactory();
+        using var errorClient = factory.CreateClient();
+        await InitializeAsync(errorClient);
+        using var response = await PostMcpAsync(errorClient, 27, "tools/call", new
+        {
+            name = "get_recipes",
+            arguments = new { mode = "ByIds", recipeIds = new[] { 1L }, includeAccountUnlocks = true }
+        });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+
+        Assert.Contains("account recipe unlocks are unavailable", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-account-recipe", payload, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -817,13 +858,34 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         }
     }
 
+    private sealed class AccountRecipeErrorMcpApplicationFactory : WebApplicationFactory<Program>
+    {
+        protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
+        {
+            builder.UseSetting("GW2_API_BUDGET_LOCK_PATH", CreateTestLockPath());
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IGw2ApiClient>();
+                services.AddSingleton<IGw2ApiClient>(new FakeGw2ApiClient(failAccountRecipeUnlocks: true));
+                services.RemoveAll<IItemCacheReader>();
+                services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
+                services.RemoveAll<IPriceSnapshotProvider>();
+                services.AddSingleton<IPriceSnapshotProvider>(new FakePriceSnapshotProvider());
+                services.RemoveAll<IItemNameLookup>();
+                services.AddSingleton<IItemNameLookup>(new FakeItemNameLookup());
+                services.RemoveAll<TimeProvider>();
+                services.AddSingleton<TimeProvider>(new FixedTimeProvider());
+            });
+        }
+    }
+
     private static string CreateTestLockPath() => Path.Combine(
         Path.GetTempPath(),
         "GW2AccountMCP.Tests",
         Guid.NewGuid().ToString("N"),
         "gw2-api-budget.lock");
 
-    private sealed class FakeGw2ApiClient : IGw2ApiClient
+    private sealed class FakeGw2ApiClient(bool failAccountRecipeUnlocks = false) : IGw2ApiClient
     {
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Account("Example.1234", 2206, DateTimeOffset.Parse("2020-01-02T03:04:05Z"), ["GuildWars2"]));
@@ -888,6 +950,11 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2RecipeSelector> SearchPublicRecipesByOutputItemAsync(long itemId, CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2RecipeSelector([2]));
 
+        public Task<Gw2AccountRecipeUnlocks> GetAccountRecipeUnlocksAsync(CancellationToken cancellationToken) =>
+            failAccountRecipeUnlocks
+                ? Task.FromException<Gw2AccountRecipeUnlocks>(new IOException("private-account-recipe"))
+                : Task.FromResult(new Gw2AccountRecipeUnlocks([999, 2]));
+
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2LegendaryArmory([new Gw2LegendaryArmoryEntry(101, 0, null, null, null, null)], false, [new Gw2MetadataWarning("metadata_unresolved", "items", "101")]));
 
@@ -939,6 +1006,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             throw new Gw2ConfigurationException("GW2 public recipe selector request failed with HTTP 503. Try again later.");
         public Task<Gw2RecipeSelector> SearchPublicRecipesByOutputItemAsync(long itemId, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2 public recipe selector request failed with HTTP 503. Try again later.");
+        public Task<Gw2AccountRecipeUnlocks> GetAccountRecipeUnlocksAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required unlocks permission. Create a key with the unlocks permission.");
 
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required unlocks permission. Create a key with the unlocks permission.");
@@ -982,6 +1051,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2PublicRecipes> GetPublicRecipesAsync(IReadOnlyList<long> recipeIds, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2RecipeSelector> SearchPublicRecipesByInputItemAsync(long itemId, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2RecipeSelector> SearchPublicRecipesByOutputItemAsync(long itemId, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2AccountRecipeUnlocks> GetAccountRecipeUnlocksAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
 

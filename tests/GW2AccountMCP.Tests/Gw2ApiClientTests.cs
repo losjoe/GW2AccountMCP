@@ -2418,6 +2418,237 @@ public sealed class Gw2ApiClientTests
     }
 
     [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_requires_only_account_and_unlocks_and_uses_bearer_route()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","unlocks"]}""",
+            "[3,1,2]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var unlocks = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"))
+            .GetAccountRecipeUnlocksAsync(CancellationToken.None);
+
+        Assert.Equal([1L, 2L, 3L], unlocks.RecipeIds);
+        Assert.Equal(
+            ["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/account/recipes?lang=en&v=2025-08-29T01%3A00%3A00.000Z"],
+            handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Equal("Bearer " + apiKey, value));
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("access_token", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_requires_a_configured_key_before_any_request()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("account")]
+    [InlineData("unlocks")]
+    public async Task GetAccountRecipeUnlocksAsync_requires_each_permission_before_account_recipe_access(string missingPermission)
+    {
+        var permissions = new[] { "account", "unlocks" }.Where(permission => permission != missingPermission);
+        var handler = new RecordingHandler("{\"permissions\":[" + string.Join(',', permissions.Select(permission => "\"" + permission + "\"")) + "]}");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.Contains(missingPermission + " permission", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_accepts_empty_and_exact_id_and_payload_bounds()
+    {
+        var emptyHandler = new RecordingHandler("""{"permissions":["account","unlocks"]}""", "[]");
+        using var emptyHttpClient = new HttpClient(emptyHandler) { BaseAddress = new Uri("https://example.test") };
+        Assert.Empty((await new Gw2ApiClient(emptyHttpClient, new Gw2ApiOptions("key", "https://example.test"))
+            .GetAccountRecipeUnlocksAsync(CancellationToken.None)).RecipeIds);
+
+        var handler = new RecordingHandler(
+            """{"permissions":["account","unlocks"]}""",
+            AccountRecipeIds(25_000),
+            """{"permissions":["account","unlocks"]}""",
+            AccountRecipePayloadAtBytes(256 * 1024));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions("key", "https://example.test"));
+
+        Assert.Equal(25_000, (await client.GetAccountRecipeUnlocksAsync(CancellationToken.None)).RecipeIds.Count);
+        Assert.Equal([1L], (await client.GetAccountRecipeUnlocksAsync(CancellationToken.None)).RecipeIds);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidAccountRecipeUnlockResponses))]
+    public async Task GetAccountRecipeUnlocksAsync_rejects_non_ok_malformed_or_over_bound_responses(ResponseSpec response)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","unlocks"]}""", response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.Contains("recipe", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static TheoryData<ResponseSpec> InvalidAccountRecipeUnlockResponses => new()
+    {
+        { new ResponseSpec("private", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("private", HttpStatusCode.NotFound) },
+        { new ResponseSpec("private", HttpStatusCode.BadRequest) },
+        { new ResponseSpec("private", HttpStatusCode.InternalServerError) },
+        { new ResponseSpec("not-json") },
+        { new ResponseSpec("{}") },
+        { new ResponseSpec("[0]") },
+        { new ResponseSpec("[1,1]") },
+        { new ResponseSpec("[1.5]") },
+        { new ResponseSpec("[\"1\"]") },
+        { new ResponseSpec(AccountRecipeIds(25_001)) },
+        { new ResponseSpec(AccountRecipePayloadAtBytes((256 * 1024) + 1)) }
+    };
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_rejects_over_limit_advertised_content_length()
+    {
+        var accountResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent("[]"u8.ToArray()) };
+        accountResponse.Content.Headers.ContentLength = (256 * 1024) + 1;
+        var handler = new RecordingHandler("""{"permissions":["account","unlocks"]}""", accountResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("key", "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    [InlineData(HttpStatusCode.Forbidden)]
+    public async Task GetAccountRecipeUnlocksAsync_maps_auth_failures_without_exposing_private_content(HttpStatusCode status)
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","unlocks"]}""",
+            new ResponseSpec("private account recipe content", status));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.Contains("GW2_API_KEY", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(apiKey, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_disposes_auth_response_when_invalid_key_classification_body_fails()
+    {
+        var content = new ThrowingTrackedHttpContent();
+        var authResponse = new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = content };
+        var handler = new RecordingHandler("""{"permissions":["account","unlocks"]}""", authResponse);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("key", "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.True(content.IsDisposed);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_retries_established_transient_and_invalid_key_cases_once()
+    {
+        var transientHandler = new RecordingHandler(
+            """{"permissions":["account","unlocks"]}""",
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            "[2]");
+        using var transientHttpClient = new HttpClient(transientHandler) { BaseAddress = new Uri("https://example.test") };
+        Assert.Equal([2L], (await new Gw2ApiClient(transientHttpClient, new Gw2ApiOptions("key", "https://example.test"))
+            .GetAccountRecipeUnlocksAsync(CancellationToken.None)).RecipeIds);
+        Assert.Equal(2, transientHandler.RequestUris.Count(uri => uri.StartsWith("/v2/account/recipes?", StringComparison.Ordinal)));
+
+        var invalidKeyHandler = new RecordingHandler(
+            """{"permissions":["account","unlocks"]}""",
+            new ResponseSpec("Invalid key", HttpStatusCode.Unauthorized),
+            "[1]");
+        using var invalidKeyHttpClient = new HttpClient(invalidKeyHandler) { BaseAddress = new Uri("https://example.test") };
+        Assert.Equal([1L], (await new Gw2ApiClient(invalidKeyHttpClient, new Gw2ApiOptions("key", "https://example.test"))
+            .GetAccountRecipeUnlocksAsync(CancellationToken.None)).RecipeIds);
+        Assert.Equal(2, invalidKeyHandler.RequestUris.Count(uri => uri.StartsWith("/v2/account/recipes?", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_propagates_transport_and_caller_cancellation()
+    {
+        var transportHandler = new RecordingHandler(
+            """{"permissions":["account","unlocks"]}""",
+            new HttpRequestException("private transport"));
+        using var transportHttpClient = new HttpClient(transportHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<HttpRequestException>(() =>
+            new Gw2ApiClient(transportHttpClient, new Gw2ApiOptions("key", "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        using var cancellationSource = new CancellationTokenSource();
+        var requestCount = 0;
+        var cancellationHandler = new RecordingHandler("""{"permissions":["account","unlocks"]}""", "[]")
+        {
+            OnRequest = () =>
+            {
+                if (++requestCount == 2) cancellationSource.Cancel();
+            }
+        };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new Gw2ApiClient(cancellationHttpClient, new Gw2ApiOptions("key", "https://example.test"))
+                .GetAccountRecipeUnlocksAsync(cancellationSource.Token));
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_times_out_when_body_stalls_after_headers()
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(timeProvider) };
+        var handler = new RecordingHandler("""{"permissions":["account","unlocks"]}""", response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("key", "https://example.test"), timeProvider)
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.True(timeProvider.Fired);
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetAccountRecipeUnlocksAsync_owns_internal_timeout_until_response_headers_arrive()
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var handler = new StallingAccountRecipeRequestHandler(timeProvider);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("key", "https://example.test"), timeProvider)
+                .GetAccountRecipeUnlocksAsync(CancellationToken.None));
+
+        Assert.True(timeProvider.Fired);
+        Assert.Equal(2, handler.RequestCount);
+    }
+
+    [Fact]
     public async Task GetItemsAsync_requests_only_caller_ids_in_order_without_authentication()
     {
         var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item"},{"id":1,"name":"First Item"}]"""));
@@ -3121,6 +3352,15 @@ public sealed class Gw2ApiClientTests
         return prefix + new string(' ', targetBytes - prefix.Length - suffix.Length) + suffix;
     }
 
+    private static string AccountRecipeIds(int count) => "[" + string.Join(',', Enumerable.Range(1, count)) + "]";
+
+    private static string AccountRecipePayloadAtBytes(int targetBytes)
+    {
+        const string prefix = "[1";
+        const string suffix = "]";
+        return prefix + new string(' ', targetBytes - prefix.Length - suffix.Length) + suffix;
+    }
+
     private static string EquipmentRow(string slot, int id, string extra = "") => "{\"slot\":\"" + slot + "\",\"id\":" + id + ",\"location\":\"Equipped\"" + extra + "}";
 
     private static string ActiveBuild(string profession, string? specializations = null, string? skills = null, string conditional = "", string outer = "", string buildExtra = "") =>
@@ -3225,6 +3465,26 @@ public sealed class Gw2ApiClientTests
         protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new StallingReadStream(timeProvider));
     }
 
+    private sealed class ThrowingTrackedHttpContent : HttpContent
+    {
+        public bool IsDisposed { get; private set; }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            Task.FromException(new IOException("private auth body failure"));
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
     private sealed class StallingReadStream(DeferredTimerTimeProvider timeProvider) : Stream
     {
         public override bool CanRead => true;
@@ -3243,6 +3503,27 @@ public sealed class Gw2ApiClientTests
             timeProvider.Fire();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return 0;
+        }
+    }
+
+    private sealed class StallingAccountRecipeRequestHandler(DeferredTimerTimeProvider timeProvider) : HttpMessageHandler
+    {
+        public int RequestCount { get; private set; }
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            RequestCount++;
+            if (RequestCount == 1)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"permissions":["account","unlocks"]}""", Encoding.UTF8, "application/json")
+                };
+            }
+
+            timeProvider.Fire();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            throw new InvalidOperationException("The timed request unexpectedly completed.");
         }
     }
 
