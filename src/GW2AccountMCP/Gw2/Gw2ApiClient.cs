@@ -20,6 +20,10 @@ public interface IGw2ApiClient
     Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken);
     Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
     Task<Gw2PublicItems> GetPublicItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
+    Task<Gw2MaterialCategories> GetPublicMaterialCategoriesAsync(CancellationToken cancellationToken);
+    Task<Gw2PublicRecipes> GetPublicRecipesAsync(IReadOnlyList<long> recipeIds, CancellationToken cancellationToken);
+    Task<Gw2RecipeSelector> SearchPublicRecipesByInputItemAsync(long itemId, CancellationToken cancellationToken);
+    Task<Gw2RecipeSelector> SearchPublicRecipesByOutputItemAsync(long itemId, CancellationToken cancellationToken);
     Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken);
 }
 
@@ -30,6 +34,12 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const int CurrentSellsPageSize = 200;
     private const int MaximumItemBatchSize = 200;
     private const int MaximumPublicItemBatchSize = 100;
+    private const int MaximumMaterialCategoryPayloadBytes = 128 * 1024;
+    private const int MaximumMaterialCategories = 64;
+    private const int MaximumMaterialMemberships = 10_000;
+    private const int MaximumPublicRecipeBatchSize = 100;
+    private const int MaximumRecipeSelectorPayloadBytes = 64 * 1024;
+    private const int MaximumRecipeSelectorIds = 5_000;
     private const int MaximumLegendaryArmoryRows = 256;
     private const int MaximumEquipmentRows = 32;
     private const int MaximumEquipmentReferences = 200;
@@ -39,6 +49,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static readonly HashSet<string> KnownSpecialEquipmentSlots = ["Sickle", "Axe", "Pick", "FishingRod", "FishingBait", "FishingLure", "PowerCore", "SensoryArray", "ServiceChip"];
     private static readonly HashSet<string> KnownInactiveEquipmentLocations = ["Armory", "LegendaryArmory"];
     private static readonly TimeSpan DefaultRetryDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan PublicRecipeAttemptTimeout = TimeSpan.FromSeconds(15);
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public async Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken)
@@ -623,6 +634,79 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             itemRows.Any(item => item.Name is null)
                 ? ["One or more returned public item names were blank and are represented as null."]
                 : []);
+    }
+
+    public async Task<Gw2MaterialCategories> GetPublicMaterialCategoriesAsync(CancellationToken cancellationToken)
+    {
+        using var response = await SendWithSingleRetryAsync(
+            "/v2/materials?ids=all",
+            cancellationToken,
+            authenticated: false);
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            throw new Gw2ConfigurationException($"GW2 public material-category request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        return new Gw2MaterialCategories(await DeserializeMaterialCategoriesAsync(response, cancellationToken));
+    }
+
+    public async Task<Gw2PublicRecipes> GetPublicRecipesAsync(IReadOnlyList<long> recipeIds, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(recipeIds);
+        if (recipeIds.Count is 0 or > MaximumPublicRecipeBatchSize
+            || recipeIds.Any(id => id <= 0)
+            || recipeIds.Distinct().Count() != recipeIds.Count)
+        {
+            throw new ArgumentException("Recipe IDs must contain 1 to 100 unique positive values.", nameof(recipeIds));
+        }
+
+        using var request = await SendPublicRecipeWithSingleRetryAsync(
+            $"/v2/recipes?ids={Uri.EscapeDataString(string.Join(',', recipeIds))}",
+            cancellationToken);
+        var response = request.Response;
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return new Gw2PublicRecipes([], recipeIds.ToArray());
+        }
+
+        if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent)
+        {
+            throw new Gw2ConfigurationException($"GW2 public recipe request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        var recipes = await DeserializePublicRecipesAsync(response, recipeIds.ToHashSet(), request.CancellationToken);
+        var recipesById = recipes.ToDictionary(recipe => recipe.Id);
+        var missingRecipeIds = recipeIds.Where(id => !recipesById.ContainsKey(id)).ToArray();
+        if ((response.StatusCode == HttpStatusCode.OK && missingRecipeIds.Length != 0)
+            || (response.StatusCode == HttpStatusCode.PartialContent && (recipes.Count == 0 || missingRecipeIds.Length == 0)))
+        {
+            throw InvalidPublicRecipeResponse();
+        }
+
+        return new Gw2PublicRecipes(
+            recipeIds.Where(recipesById.ContainsKey).Select(id => recipesById[id]).ToArray(),
+            missingRecipeIds);
+    }
+
+    public Task<Gw2RecipeSelector> SearchPublicRecipesByInputItemAsync(long itemId, CancellationToken cancellationToken) =>
+        SearchPublicRecipesAsync("input", itemId, cancellationToken);
+
+    public Task<Gw2RecipeSelector> SearchPublicRecipesByOutputItemAsync(long itemId, CancellationToken cancellationToken) =>
+        SearchPublicRecipesAsync("output", itemId, cancellationToken);
+
+    private async Task<Gw2RecipeSelector> SearchPublicRecipesAsync(string selector, long itemId, CancellationToken cancellationToken)
+    {
+        if (itemId <= 0) throw new ArgumentOutOfRangeException(nameof(itemId), "Item ID must be positive.");
+        using var request = await SendPublicRecipeWithSingleRetryAsync(
+            $"/v2/recipes/search?{selector}={itemId.ToString(CultureInfo.InvariantCulture)}",
+            cancellationToken);
+        var response = request.Response;
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            throw new Gw2ConfigurationException($"GW2 public recipe selector request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        return new Gw2RecipeSelector(await DeserializeRecipeSelectorAsync(response, request.CancellationToken));
     }
 
     public async Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken)
@@ -1482,6 +1566,275 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private async Task<IReadOnlyList<Gw2MaterialCategory>> DeserializeMaterialCategoriesAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (response.Content.Headers.ContentLength is > MaximumMaterialCategoryPayloadBytes)
+            {
+                throw InvalidPublicMaterialCategoryResponse();
+            }
+
+            await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var payload = new MemoryStream();
+            var buffer = new byte[8192];
+            while (true)
+            {
+                var bytesRead = await responseStream.ReadAsync(buffer, cancellationToken);
+                if (bytesRead == 0) break;
+                if (payload.Length + bytesRead > MaximumMaterialCategoryPayloadBytes)
+                {
+                    throw InvalidPublicMaterialCategoryResponse();
+                }
+
+                await payload.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+            }
+
+            payload.Position = 0;
+            using var document = await JsonDocument.ParseAsync(payload, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array
+                || document.RootElement.GetArrayLength() > MaximumMaterialCategories)
+            {
+                throw InvalidPublicMaterialCategoryResponse();
+            }
+
+            var categories = new List<Gw2MaterialCategory>();
+            var categoryIds = new HashSet<long>();
+            var membershipCount = 0;
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object) throw InvalidPublicMaterialCategoryResponse();
+                var id = MaterialCategoryLong(element, "id");
+                var name = MaterialCategoryString(element, "name");
+                var order = MaterialCategoryLong(element, "order");
+                var items = MaterialCategoryProperty(element, "items");
+                if (id <= 0 || !categoryIds.Add(id) || items.ValueKind != JsonValueKind.Array)
+                {
+                    throw InvalidPublicMaterialCategoryResponse();
+                }
+
+                var itemIds = new List<long>();
+                var uniqueItemIds = new HashSet<long>();
+                foreach (var item in items.EnumerateArray())
+                {
+                    if (item.ValueKind != JsonValueKind.Number
+                        || !item.TryGetInt64(out var itemId)
+                        || itemId <= 0
+                        || !uniqueItemIds.Add(itemId))
+                    {
+                        throw InvalidPublicMaterialCategoryResponse();
+                    }
+
+                    membershipCount = checked(membershipCount + 1);
+                    if (membershipCount > MaximumMaterialMemberships) throw InvalidPublicMaterialCategoryResponse();
+                    itemIds.Add(itemId);
+                }
+
+                categories.Add(new Gw2MaterialCategory(id, name, order, itemIds));
+            }
+
+            return categories;
+        }
+        catch (JsonException)
+        {
+            throw InvalidPublicMaterialCategoryResponse();
+        }
+        catch (OverflowException)
+        {
+            throw InvalidPublicMaterialCategoryResponse();
+        }
+    }
+
+    private static JsonElement MaterialCategoryProperty(JsonElement category, string name)
+    {
+        var properties = category.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        return properties.Length == 1 ? properties[0].Value : throw InvalidPublicMaterialCategoryResponse();
+    }
+
+    private static long MaterialCategoryLong(JsonElement category, string name)
+    {
+        var value = MaterialCategoryProperty(category, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number)) throw InvalidPublicMaterialCategoryResponse();
+        return number;
+    }
+
+    private static string MaterialCategoryString(JsonElement category, string name)
+    {
+        var value = MaterialCategoryProperty(category, name);
+        if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString())) throw InvalidPublicMaterialCategoryResponse();
+        return value.GetString()!;
+    }
+
+    private async Task<IReadOnlyList<Gw2PublicRecipe>> DeserializePublicRecipesAsync(
+        HttpResponseMessage response,
+        IReadOnlySet<long> requestedIds,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) throw InvalidPublicRecipeResponse();
+
+            var recipes = new List<Gw2PublicRecipe>();
+            var recipeIds = new HashSet<long>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object) throw InvalidPublicRecipeResponse();
+                var id = RecipeLong(element, "id");
+                var type = RecipeString(element, "type");
+                var outputItemId = RecipeLong(element, "output_item_id");
+                var outputItemCount = RecipeLong(element, "output_item_count");
+                var timeToCraftMs = RecipeLong(element, "time_to_craft_ms");
+                var minRating = RecipeLong(element, "min_rating");
+                if (id <= 0
+                    || !requestedIds.Contains(id)
+                    || !recipeIds.Add(id)
+                    || outputItemId <= 0
+                    || outputItemCount <= 0
+                    || timeToCraftMs < 0
+                    || minRating < 0)
+                {
+                    throw InvalidPublicRecipeResponse();
+                }
+
+                var ingredientsElement = RecipeProperty(element, "ingredients");
+                if (ingredientsElement.ValueKind != JsonValueKind.Array) throw InvalidPublicRecipeResponse();
+                var ingredients = new List<Gw2RecipeIngredient>();
+                foreach (var ingredientElement in ingredientsElement.EnumerateArray())
+                {
+                    if (ingredientElement.ValueKind != JsonValueKind.Object) throw InvalidPublicRecipeResponse();
+                    var kind = RecipeString(ingredientElement, "type");
+                    var ingredientId = RecipeLong(ingredientElement, "id");
+                    var count = RecipeLong(ingredientElement, "count");
+                    if (ingredientId <= 0 || count <= 0) throw InvalidPublicRecipeResponse();
+                    ingredients.Add(new Gw2RecipeIngredient(kind, ingredientId, count));
+                }
+
+                recipes.Add(new Gw2PublicRecipe(
+                    id,
+                    type,
+                    outputItemId,
+                    outputItemCount,
+                    OptionalRecipePositiveLong(element, "output_upgrade_id"),
+                    minRating,
+                    timeToCraftMs,
+                    RecipeStrings(element, "disciplines"),
+                    RecipeStrings(element, "flags"),
+                    ingredients));
+            }
+
+            return recipes;
+        }
+        catch (JsonException)
+        {
+            throw InvalidPublicRecipeResponse();
+        }
+    }
+
+    private async Task<IReadOnlyList<long>> DeserializeRecipeSelectorAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            if (response.Content.Headers.ContentLength is > MaximumRecipeSelectorPayloadBytes)
+            {
+                throw InvalidPublicRecipeSelectorResponse();
+            }
+
+            await using var responseStream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var payload = new MemoryStream();
+            var buffer = new byte[8192];
+            while (true)
+            {
+                var bytesRead = await responseStream.ReadAsync(buffer, cancellationToken);
+                if (bytesRead == 0) break;
+                if (payload.Length + bytesRead > MaximumRecipeSelectorPayloadBytes)
+                {
+                    throw InvalidPublicRecipeSelectorResponse();
+                }
+
+                await payload.WriteAsync(buffer.AsMemory(0, bytesRead), cancellationToken);
+            }
+
+            payload.Position = 0;
+            using var document = await JsonDocument.ParseAsync(payload, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array
+                || document.RootElement.GetArrayLength() > MaximumRecipeSelectorIds)
+            {
+                throw InvalidPublicRecipeSelectorResponse();
+            }
+
+            var recipeIds = new HashSet<long>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Number
+                    || !element.TryGetInt64(out var recipeId)
+                    || recipeId <= 0
+                    || !recipeIds.Add(recipeId))
+                {
+                    throw InvalidPublicRecipeSelectorResponse();
+                }
+            }
+
+            return recipeIds.Order().ToArray();
+        }
+        catch (JsonException)
+        {
+            throw InvalidPublicRecipeSelectorResponse();
+        }
+    }
+
+    private static JsonElement RecipeProperty(JsonElement recipe, string name)
+    {
+        var properties = recipe.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        return properties.Length == 1 ? properties[0].Value : throw InvalidPublicRecipeResponse();
+    }
+
+    private static long RecipeLong(JsonElement recipe, string name)
+    {
+        var value = RecipeProperty(recipe, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number)) throw InvalidPublicRecipeResponse();
+        return number;
+    }
+
+    private static long? OptionalRecipePositiveLong(JsonElement recipe, string name)
+    {
+        var properties = recipe.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        if (properties.Length == 0) return null;
+        if (properties.Length != 1
+            || properties[0].Value.ValueKind != JsonValueKind.Number
+            || !properties[0].Value.TryGetInt64(out var number)
+            || number <= 0)
+        {
+            throw InvalidPublicRecipeResponse();
+        }
+
+        return number;
+    }
+
+    private static string RecipeString(JsonElement recipe, string name)
+    {
+        var value = RecipeProperty(recipe, name);
+        if (value.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(value.GetString())) throw InvalidPublicRecipeResponse();
+        return value.GetString()!;
+    }
+
+    private static IReadOnlyList<string> RecipeStrings(JsonElement recipe, string name)
+    {
+        var value = RecipeProperty(recipe, name);
+        if (value.ValueKind != JsonValueKind.Array) throw InvalidPublicRecipeResponse();
+        var values = new List<string>();
+        foreach (var element in value.EnumerateArray())
+        {
+            if (element.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(element.GetString())) throw InvalidPublicRecipeResponse();
+            values.Add(element.GetString()!);
+        }
+
+        return values.Order(StringComparer.Ordinal).ToArray();
+    }
+
     private static JsonElement PublicItemProperty(JsonElement item, string name)
     {
         var properties = item.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
@@ -1935,6 +2288,39 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return body.Contains("invalid key", StringComparison.OrdinalIgnoreCase);
     }
 
+    private async Task<TimedHttpResponse> SendPublicRecipeWithSingleRetryAsync(string path, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var timeoutSource = new CancellationTokenSource(PublicRecipeAttemptTimeout, timeProvider ?? TimeProvider.System);
+            var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+            HttpResponseMessage response;
+            try
+            {
+                response = await SendAsync(path, linkedSource.Token, authenticated: false);
+            }
+            catch
+            {
+                linkedSource.Dispose();
+                timeoutSource.Dispose();
+                throw;
+            }
+
+            if (attempt == 0
+                && response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout)
+            {
+                var retryDelay = GetRetryDelay(response);
+                response.Dispose();
+                linkedSource.Dispose();
+                timeoutSource.Dispose();
+                await Task.Delay(retryDelay, timeProvider ?? TimeProvider.System, cancellationToken);
+                continue;
+            }
+
+            return new TimedHttpResponse(response, timeoutSource, linkedSource);
+        }
+    }
+
     private async Task<HttpResponseMessage> SendWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated = true)
     {
         for (var attempt = 0; ; attempt++)
@@ -2015,12 +2401,31 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
     private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
     private static Gw2ConfigurationException InvalidPublicItemResponse() => new("GW2 returned an invalid public item response. Try again later.");
+    private static Gw2ConfigurationException InvalidPublicMaterialCategoryResponse() => new("GW2 returned an invalid public material-category response. Try again later.");
+    private static Gw2ConfigurationException InvalidPublicRecipeResponse() => new("GW2 returned an invalid public recipe response. Try again later.");
+    private static Gw2ConfigurationException InvalidPublicRecipeSelectorResponse() => new("GW2 returned an invalid public recipe selector response. Try again later.");
     private static Gw2ConfigurationException InvalidLegendaryArmoryResponse() => new("GW2 returned an invalid Legendary Armory response. Try again later.");
     private static Gw2ConfigurationException InvalidLegendaryArmoryMetadataResponse() => new("GW2 returned invalid Legendary Armory item metadata. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
     private static Gw2ConfigurationException CharacterInventoryContextLimitExceeded() => new("GW2 character inventory exceeds configured response limits. Try again later.");
+
+    private sealed class TimedHttpResponse(
+        HttpResponseMessage response,
+        CancellationTokenSource timeoutSource,
+        CancellationTokenSource linkedSource) : IDisposable
+    {
+        public HttpResponseMessage Response { get; } = response;
+        public CancellationToken CancellationToken => linkedSource.Token;
+
+        public void Dispose()
+        {
+            Response.Dispose();
+            linkedSource.Dispose();
+            timeoutSource.Dispose();
+        }
+    }
 
     private sealed record ActiveBuildPayload(int Tab, string Name, string Profession, IReadOnlyList<SpecializationSlot> Specializations, SkillSlots TerrestrialSkills, SkillSlots AquaticSkills, PetSlots? Pets, LegendSlots? Legends);
     private sealed record SpecializationSlot(int? Id, IReadOnlyList<int?> Traits);
@@ -2178,6 +2583,22 @@ public sealed record Gw2Items(IReadOnlyList<Gw2Item> Items, IReadOnlyList<long> 
 public sealed record Gw2Item(long Id, string Name);
 public sealed record Gw2PublicItems(IReadOnlyList<Gw2PublicItem> Items, IReadOnlyList<long> MissingItemIds, IReadOnlyList<string> Warnings);
 public sealed record Gw2PublicItem(long Id, string? Name, string Type, string Rarity, long Level, long VendorValue, IReadOnlyList<string> Flags, IReadOnlyList<string> GameTypes, IReadOnlyList<string> Restrictions);
+public sealed record Gw2MaterialCategories(IReadOnlyList<Gw2MaterialCategory> Categories);
+public sealed record Gw2MaterialCategory(long Id, string Name, long Order, IReadOnlyList<long> ItemIds);
+public sealed record Gw2PublicRecipes(IReadOnlyList<Gw2PublicRecipe> Recipes, IReadOnlyList<long> MissingRecipeIds);
+public sealed record Gw2PublicRecipe(
+    long Id,
+    string Type,
+    long OutputItemId,
+    long OutputItemCount,
+    long? OutputUpgradeId,
+    long MinRating,
+    long TimeToCraftMs,
+    IReadOnlyList<string> Disciplines,
+    IReadOnlyList<string> Flags,
+    IReadOnlyList<Gw2RecipeIngredient> Ingredients);
+public sealed record Gw2RecipeIngredient(string Kind, long Id, long Count);
+public sealed record Gw2RecipeSelector(IReadOnlyList<long> RecipeIds);
 public sealed record Gw2LegendaryArmory(IReadOnlyList<Gw2LegendaryArmoryEntry> Entries, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
 public sealed record Gw2LegendaryArmoryEntry(long Id, long ArmoryCount, string? Name, string? Type, string? Subtype, string? WeightClass);
 public sealed record Gw2CharacterBuild(

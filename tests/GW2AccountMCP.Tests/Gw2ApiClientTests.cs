@@ -2079,6 +2079,345 @@ public sealed class Gw2ApiClientTests
     }
 
     [Fact]
+    public async Task GetPublicMaterialCategoriesAsync_returns_complete_categories_without_authentication()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second","order":3,"items":[10,11],"future":true},{"id":1,"name":"First","order":1,"items":[10]}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var categories = await new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"))
+            .GetPublicMaterialCategoriesAsync(CancellationToken.None);
+
+        Assert.Equal([(2L, "Second", 3L), (1L, "First", 1L)], categories.Categories.Select(category => (category.Id, category.Name, category.Order)));
+        Assert.Equal([10L, 11L], categories.Categories[0].ItemIds);
+        Assert.Equal([10L], categories.Categories[1].ItemIds);
+        Assert.Equal(["/v2/materials?ids=all&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.Equal([null], handler.AuthorizationHeaders);
+    }
+
+    [Fact]
+    public async Task GetPublicMaterialCategoriesAsync_accepts_exact_category_and_membership_bounds()
+    {
+        var handler = new RecordingHandler(MaterialCategoriesPayload(64, 10_000));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var categories = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .GetPublicMaterialCategoriesAsync(CancellationToken.None);
+
+        Assert.Equal(64, categories.Categories.Count);
+        Assert.Equal(10_000, categories.Categories.Sum(category => category.ItemIds.Count));
+    }
+
+    [Fact]
+    public async Task GetPublicMaterialCategoriesAsync_accepts_exact_payload_bound()
+    {
+        var payload = MaterialPayloadAtBytes(128 * 1024);
+        var handler = new RecordingHandler(payload);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var categories = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .GetPublicMaterialCategoriesAsync(CancellationToken.None);
+
+        Assert.Single(categories.Categories);
+        Assert.Equal(128 * 1024, Encoding.UTF8.GetByteCount(payload));
+    }
+
+    [Theory]
+    [MemberData(nameof(OverBoundPublicMaterialCategoryResponses))]
+    public async Task GetPublicMaterialCategoriesAsync_rejects_over_bound_responses(string payload)
+    {
+        var handler = new RecordingHandler(payload);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .GetPublicMaterialCategoriesAsync(CancellationToken.None));
+
+        Assert.Contains("material-category response", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static TheoryData<string> OverBoundPublicMaterialCategoryResponses => new()
+    {
+        { MaterialCategoriesPayload(65, 65) },
+        { MaterialCategoriesPayload(1, 10_001) },
+        { MaterialPayloadAtBytes((128 * 1024) + 1) }
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidPublicMaterialCategoryResponses))]
+    public async Task GetPublicMaterialCategoriesAsync_rejects_malformed_contracts_and_non_200_statuses(ResponseSpec response)
+    {
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"))
+                .GetPublicMaterialCategoriesAsync(CancellationToken.None));
+
+        Assert.Contains("material-category", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static TheoryData<ResponseSpec> InvalidPublicMaterialCategoryResponses => new()
+    {
+        { new ResponseSpec("private body", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("private body", HttpStatusCode.NotFound) },
+        { new ResponseSpec("private body", HttpStatusCode.Unauthorized) },
+        { new ResponseSpec("not-json") },
+        { new ResponseSpec("{}") },
+        { new ResponseSpec("[{}]") },
+        { new ResponseSpec("""[{"id":0,"name":"Name","order":0,"items":[]}]""") },
+        { new ResponseSpec("""[{"id":1,"name":" ","order":0,"items":[]}]""") },
+        { new ResponseSpec("""[{"id":1,"name":"Name","order":0.5,"items":[]}]""") },
+        { new ResponseSpec("""[{"id":1,"name":"Name","order":0,"items":[0]}]""") },
+        { new ResponseSpec("""[{"id":1,"name":"Name","order":0,"items":[2,2]}]""") },
+        { new ResponseSpec("""[{"id":1,"name":"One","order":0,"items":[]},{"id":1,"name":"Two","order":1,"items":[]}]""") },
+        { new ResponseSpec("""[{"id":1,"id":2,"name":"Name","order":0,"items":[]}]""") }
+    };
+
+    [Fact]
+    public async Task GetPublicMaterialCategoriesAsync_retries_transient_responses_and_propagates_caller_cancellation()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec("[]"));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .GetPublicMaterialCategoriesAsync(CancellationToken.None);
+
+        Assert.Equal(2, handler.RequestUris.Count);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Null(value));
+
+        using var cancellationSource = new CancellationTokenSource();
+        var cancellationHandler = new RecordingHandler("[]") { OnRequest = cancellationSource.Cancel };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new Gw2ApiClient(cancellationHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .GetPublicMaterialCategoriesAsync(cancellationSource.Token));
+    }
+
+    [Fact]
+    public async Task GetPublicRecipesAsync_returns_rich_rows_in_caller_order_without_authentication()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"type":"FutureType","output_item_id":20,"output_item_count":3,"output_upgrade_id":200,"time_to_craft_ms":1000,"disciplines":["Weaponsmith","Artificer"],"min_rating":400,"flags":["LearnedFromItem","AutoLearned"],"ingredients":[{"type":"FutureKind","id":10,"count":2}],"future":true},{"id":1,"type":"Refinement","output_item_id":30,"output_item_count":1,"time_to_craft_ms":0,"disciplines":[],"min_rating":0,"flags":[],"ingredients":[]}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var recipes = await new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"))
+            .GetPublicRecipesAsync([2, 1], CancellationToken.None);
+
+        Assert.Equal([2L, 1L], recipes.Recipes.Select(recipe => recipe.Id));
+        Assert.Equal(("FutureType", 20L, 3L, 200L, 400L, 1000L), recipes.Recipes[0] is var recipe
+            ? (recipe.Type, recipe.OutputItemId, recipe.OutputItemCount, recipe.OutputUpgradeId, recipe.MinRating, recipe.TimeToCraftMs)
+            : default);
+        Assert.Equal(["Artificer", "Weaponsmith"], recipes.Recipes[0].Disciplines);
+        Assert.Equal(["AutoLearned", "LearnedFromItem"], recipes.Recipes[0].Flags);
+        Assert.Equal(("FutureKind", 10L, 2L), Assert.Single(recipes.Recipes[0].Ingredients) is var ingredient ? (ingredient.Kind, ingredient.Id, ingredient.Count) : default);
+        Assert.Empty(recipes.MissingRecipeIds);
+        Assert.Equal(["/v2/recipes?ids=2%2C1&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.Equal([null], handler.AuthorizationHeaders);
+    }
+
+    [Fact]
+    public async Task GetPublicRecipesAsync_accepts_proper_partial_and_not_found_semantics()
+    {
+        var partialHandler = new RecordingHandler(new ResponseSpec(RecipePayload(2), HttpStatusCode.PartialContent));
+        using var partialHttpClient = new HttpClient(partialHandler) { BaseAddress = new Uri("https://example.test") };
+        var partial = await new Gw2ApiClient(partialHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .GetPublicRecipesAsync([3, 2, 1], CancellationToken.None);
+        Assert.Equal([2L], partial.Recipes.Select(recipe => recipe.Id));
+        Assert.Equal([3L, 1L], partial.MissingRecipeIds);
+
+        var missingHandler = new RecordingHandler(new ResponseSpec("private", HttpStatusCode.NotFound));
+        using var missingHttpClient = new HttpClient(missingHandler) { BaseAddress = new Uri("https://example.test") };
+        var missing = await new Gw2ApiClient(missingHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .GetPublicRecipesAsync([2, 1], CancellationToken.None);
+        Assert.Empty(missing.Recipes);
+        Assert.Equal([2L, 1L], missing.MissingRecipeIds);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidPublicRecipeIdBatches))]
+    public async Task GetPublicRecipesAsync_rejects_invalid_batches_before_request(long[] recipeIds)
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .GetPublicRecipesAsync(recipeIds, CancellationToken.None));
+
+        Assert.Empty(handler.RequestUris);
+    }
+
+    public static TheoryData<long[]> InvalidPublicRecipeIdBatches => new()
+    {
+        { [] }, { [0] }, { [-1] }, { [1, 1] }, { Enumerable.Range(1, 101).Select(id => (long)id).ToArray() }
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidPublicRecipeResponses))]
+    public async Task GetPublicRecipesAsync_rejects_malformed_records_and_status_contradictions(ResponseSpec response)
+    {
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"))
+                .GetPublicRecipesAsync([1, 2], CancellationToken.None));
+
+        Assert.Contains("public recipe", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static TheoryData<ResponseSpec> InvalidPublicRecipeResponses => new()
+    {
+        { new ResponseSpec("private body", HttpStatusCode.InternalServerError) },
+        { new ResponseSpec("not-json") },
+        { new ResponseSpec("[]") },
+        { new ResponseSpec("[]", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("[" + RecipeObject(1) + "," + RecipeObject(2) + "]", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("[" + RecipeObject(1) + "," + RecipeObject(1) + "]") },
+        { new ResponseSpec("[" + RecipeObject(1) + "," + RecipeObject(3) + "]") },
+        { new ResponseSpec("""[{"id":1}]""", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("[" + RecipeObject(1, outputItemCount: 0) + "]", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("[" + RecipeObject(1, ingredients: "[{\"type\":\"Item\",\"id\":0,\"count\":1}]") + "]", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("[" + RecipeObject(1, ingredients: "[{\"type\":\"Item\",\"id\":1,\"count\":0}]") + "]", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("[" + RecipeObject(1, extra: ",\"id\":9") + "]", HttpStatusCode.PartialContent) }
+    };
+
+    [Fact]
+    public async Task GetPublicRecipesAsync_retries_transient_responses_and_propagates_caller_cancellation()
+    {
+        var handler = new RecordingHandler(
+            new ResponseSpec("", HttpStatusCode.ServiceUnavailable),
+            new ResponseSpec(RecipePayload(1)));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .GetPublicRecipesAsync([1], CancellationToken.None);
+        Assert.Equal(2, handler.RequestUris.Count);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Null(value));
+
+        using var cancellationSource = new CancellationTokenSource();
+        var cancellationHandler = new RecordingHandler(RecipePayload(1)) { OnRequest = cancellationSource.Cancel };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new Gw2ApiClient(cancellationHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .GetPublicRecipesAsync([1], cancellationSource.Token));
+    }
+
+    [Fact]
+    public async Task Recipe_selectors_use_unpaged_public_routes_and_sort_ids()
+    {
+        var handler = new RecordingHandler("[3,1,2]", "[]");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"));
+
+        var input = await client.SearchPublicRecipesByInputItemAsync(10, CancellationToken.None);
+        var output = await client.SearchPublicRecipesByOutputItemAsync(20, CancellationToken.None);
+
+        Assert.Equal([1L, 2L, 3L], input.RecipeIds);
+        Assert.Empty(output.RecipeIds);
+        Assert.Equal(
+            [
+                "/v2/recipes/search?input=10&lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+                "/v2/recipes/search?output=20&lang=en&v=2025-08-29T01%3A00%3A00.000Z"
+            ],
+            handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Null(value));
+    }
+
+    [Fact]
+    public async Task Recipe_selector_accepts_exact_id_and_payload_bounds()
+    {
+        var handler = new RecordingHandler(RecipeSelectorIds(5_000), RecipeSelectorPayloadAtBytes(64 * 1024));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"));
+
+        var ids = await client.SearchPublicRecipesByInputItemAsync(1, CancellationToken.None);
+        var payload = await client.SearchPublicRecipesByOutputItemAsync(1, CancellationToken.None);
+
+        Assert.Equal(5_000, ids.RecipeIds.Count);
+        Assert.Equal([1L], payload.RecipeIds);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidRecipeSelectorResponses))]
+    public async Task Recipe_selector_rejects_malformed_incomplete_or_over_bound_responses(ResponseSpec response)
+    {
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() =>
+            new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"))
+                .SearchPublicRecipesByInputItemAsync(1, CancellationToken.None));
+
+        Assert.Contains("recipe selector", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+    }
+
+    public static TheoryData<ResponseSpec> InvalidRecipeSelectorResponses => new()
+    {
+        { new ResponseSpec("private", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("private", HttpStatusCode.NotFound) },
+        { new ResponseSpec("not-json") },
+        { new ResponseSpec("{}") },
+        { new ResponseSpec("[0]") },
+        { new ResponseSpec("[1,1]") },
+        { new ResponseSpec("[\"1\"]") },
+        { new ResponseSpec(RecipeSelectorIds(5_001)) },
+        { new ResponseSpec(RecipeSelectorPayloadAtBytes((64 * 1024) + 1)) }
+    };
+
+    [Fact]
+    public async Task Recipe_selector_validates_ids_retries_transient_responses_and_propagates_cancellation()
+    {
+        var invalidHandler = new RecordingHandler();
+        using var invalidHttpClient = new HttpClient(invalidHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<ArgumentOutOfRangeException>(() =>
+            new Gw2ApiClient(invalidHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .SearchPublicRecipesByInputItemAsync(0, CancellationToken.None));
+        Assert.Empty(invalidHandler.RequestUris);
+
+        var handler = new RecordingHandler(new ResponseSpec("", HttpStatusCode.ServiceUnavailable), new ResponseSpec("[]"));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+            .SearchPublicRecipesByOutputItemAsync(1, CancellationToken.None);
+        Assert.Equal(2, handler.RequestUris.Count);
+
+        using var cancellationSource = new CancellationTokenSource();
+        var cancellationHandler = new RecordingHandler("[]") { OnRequest = cancellationSource.Cancel };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            new Gw2ApiClient(cancellationHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test"))
+                .SearchPublicRecipesByOutputItemAsync(1, cancellationSource.Token));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Public_recipe_operations_timeout_when_the_body_stalls_after_headers(bool selector)
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var response = new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StallingHttpContent(timeProvider)
+        };
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test"), timeProvider);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => selector
+            ? client.SearchPublicRecipesByInputItemAsync(1, CancellationToken.None)
+            : client.GetPublicRecipesAsync([1], CancellationToken.None));
+
+        Assert.True(timeProvider.Fired);
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
     public async Task GetItemsAsync_requests_only_caller_ids_in_order_without_authentication()
     {
         var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item"},{"id":1,"name":"First Item"}]"""));
@@ -2745,6 +3084,43 @@ public sealed class Gw2ApiClientTests
     private static string LegendaryMetadata(IEnumerable<long> ids) =>
         "[" + string.Join(',', ids.Select(id => "{\"id\":" + id + ",\"name\":\"Synthetic " + id + "\",\"type\":\"Weapon\"}")) + "]";
 
+    private static string MaterialCategoriesPayload(int categoryCount, int membershipCount)
+    {
+        var membershipsPerCategory = Math.DivRem(membershipCount, categoryCount, out var remainder);
+        return "[" + string.Join(',', Enumerable.Range(1, categoryCount).Select(categoryId =>
+        {
+            var count = membershipsPerCategory + (categoryId <= remainder ? 1 : 0);
+            return "{\"id\":" + categoryId + ",\"name\":\"Category " + categoryId + "\",\"order\":" + categoryId
+                + ",\"items\":[" + string.Join(',', Enumerable.Range(1, count)) + "]}";
+        })) + "]";
+    }
+
+    private static string MaterialPayloadAtBytes(int targetBytes)
+    {
+        const string prefix = "[{\"id\":1,\"name\":\"Category\",\"order\":0,\"items\":[],\"padding\":\"";
+        const string suffix = "\"}]";
+        var paddingLength = targetBytes - Encoding.UTF8.GetByteCount(prefix + suffix);
+        return prefix + new string('x', paddingLength) + suffix;
+    }
+
+    private static string RecipePayload(params long[] ids) => "[" + string.Join(',', ids.Select(id => RecipeObject(id))) + "]";
+
+    private static string RecipeObject(long id, long outputItemCount = 1, string ingredients = "[]", string extra = "") =>
+        "{\"id\":" + id
+        + ",\"type\":\"Refinement\",\"output_item_id\":" + (id + 100)
+        + ",\"output_item_count\":" + outputItemCount
+        + ",\"time_to_craft_ms\":1000,\"disciplines\":[],\"min_rating\":0,\"flags\":[],\"ingredients\":" + ingredients
+        + extra + "}";
+
+    private static string RecipeSelectorIds(int count) => "[" + string.Join(',', Enumerable.Range(1, count)) + "]";
+
+    private static string RecipeSelectorPayloadAtBytes(int targetBytes)
+    {
+        const string prefix = "[1";
+        const string suffix = "]";
+        return prefix + new string(' ', targetBytes - prefix.Length - suffix.Length) + suffix;
+    }
+
     private static string EquipmentRow(string slot, int id, string extra = "") => "{\"slot\":\"" + slot + "\",\"id\":" + id + ",\"location\":\"Equipped\"" + extra + "}";
 
     private static string ActiveBuild(string profession, string? specializations = null, string? skills = null, string conditional = "", string outer = "", string buildExtra = "") =>
@@ -2808,6 +3184,68 @@ public sealed class Gw2ApiClientTests
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
+    private sealed class DeferredTimerTimeProvider : TimeProvider
+    {
+        private TimerCallback? callback;
+        private object? state;
+
+        public bool Fired { get; private set; }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            this.callback = callback;
+            this.state = state;
+            return new DeferredTimer();
+        }
+
+        public void Fire()
+        {
+            if (callback is null) throw new InvalidOperationException("The recipe operation did not create an owned timeout.");
+            Fired = true;
+            callback(state);
+        }
+    }
+
+    private sealed class DeferredTimer : ITimer
+    {
+        public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+        public void Dispose() { }
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    private sealed class StallingHttpContent(DeferredTimerTimeProvider timeProvider) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => throw new NotSupportedException();
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new StallingReadStream(timeProvider));
+    }
+
+    private sealed class StallingReadStream(DeferredTimerTimeProvider timeProvider) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            timeProvider.Fire();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+    }
+
     private sealed class RecordingHandler(params object[] responses) : HttpMessageHandler
     {
         private readonly Queue<object> responses = new(responses);
@@ -2821,7 +3259,9 @@ public sealed class Gw2ApiClientTests
             RequestUris.Add(request.RequestUri!.PathAndQuery);
             AuthorizationHeaders.Add(request.Headers.Authorization?.ToString());
             OnRequest?.Invoke();
-            var response = responses.Dequeue() switch
+            var nextResponse = responses.Dequeue();
+            if (nextResponse is HttpResponseMessage directResponse) return Task.FromResult(directResponse);
+            var response = nextResponse switch
             {
                 string content => new ResponseSpec(content, responses.Count > 0 && responses.Peek() is HttpStatusCode status ? (HttpStatusCode)responses.Dequeue() : HttpStatusCode.OK),
                 ResponseSpec specification => specification,

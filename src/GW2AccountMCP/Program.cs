@@ -38,6 +38,7 @@ builder.Services
     .WithHttpTransport(options => options.Stateless = true)
     .WithTools<FindItemsTool>()
     .WithTools<GetItemsTool>()
+    .WithTools<GetRecipesTool>()
     .WithTools<GetItemPricesTool>()
     .WithTools<ValueItemsTool>()
     .WithTools<GetAccountTool>()
