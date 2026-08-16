@@ -19,6 +19,7 @@ public interface IGw2ApiClient
     Task<Gw2TradingPostDelivery> GetTradingPostDeliveryAsync(CancellationToken cancellationToken);
     Task<Gw2CurrentSells> GetCurrentSellsAsync(CancellationToken cancellationToken);
     Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
+    Task<Gw2PublicItems> GetPublicItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken);
     Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken);
 }
 
@@ -28,6 +29,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const string Language = "en";
     private const int CurrentSellsPageSize = 200;
     private const int MaximumItemBatchSize = 200;
+    private const int MaximumPublicItemBatchSize = 100;
     private const int MaximumLegendaryArmoryRows = 256;
     private const int MaximumEquipmentRows = 32;
     private const int MaximumEquipmentReferences = 200;
@@ -580,6 +582,47 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2Items(
             itemIds.Where(itemsById.ContainsKey).Select(id => new Gw2Item(id, itemsById[id].Name!)).ToArray(),
             missingItemIds);
+    }
+
+    public async Task<Gw2PublicItems> GetPublicItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(itemIds);
+        if (itemIds.Count is 0 or > MaximumPublicItemBatchSize
+            || itemIds.Any(id => id <= 0)
+            || itemIds.Distinct().Count() != itemIds.Count)
+        {
+            throw new ArgumentException("Item IDs must contain 1 to 100 unique positive values.", nameof(itemIds));
+        }
+
+        using var response = await SendWithSingleRetryAsync(
+            $"/v2/items?ids={Uri.EscapeDataString(string.Join(',', itemIds))}",
+            cancellationToken,
+            authenticated: false);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return new Gw2PublicItems([], itemIds.ToArray(), []);
+        }
+
+        if (response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent)
+        {
+            throw new Gw2ConfigurationException($"GW2 public item request failed with HTTP {(int)response.StatusCode}. Try again later.");
+        }
+
+        var itemRows = await DeserializePublicItemsAsync(response, itemIds.ToHashSet(), cancellationToken);
+        var itemsById = itemRows.ToDictionary(item => item.Id);
+        var missingItemIds = itemIds.Where(id => !itemsById.ContainsKey(id)).ToArray();
+        if ((response.StatusCode == HttpStatusCode.OK && missingItemIds.Length != 0)
+            || (response.StatusCode == HttpStatusCode.PartialContent && (itemRows.Count == 0 || missingItemIds.Length == 0)))
+        {
+            throw InvalidPublicItemResponse();
+        }
+
+        return new Gw2PublicItems(
+            itemIds.Where(itemsById.ContainsKey).Select(id => itemsById[id]).ToArray(),
+            missingItemIds,
+            itemRows.Any(item => item.Name is null)
+                ? ["One or more returned public item names were blank and are represented as null."]
+                : []);
     }
 
     public async Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken)
@@ -1396,6 +1439,83 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private async Task<List<Gw2PublicItem>> DeserializePublicItemsAsync(
+        HttpResponseMessage response,
+        IReadOnlySet<long> requestedIds,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) throw InvalidPublicItemResponse();
+
+            var items = new List<Gw2PublicItem>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object) throw InvalidPublicItemResponse();
+                var id = PublicItemLong(element, "id");
+                var name = PublicItemString(element, "name", allowBlank: true);
+                var type = PublicItemString(element, "type", allowBlank: false);
+                var rarity = PublicItemString(element, "rarity", allowBlank: false);
+                var level = PublicItemLong(element, "level");
+                var vendorValue = PublicItemLong(element, "vendor_value");
+                if (id <= 0 || level < 0 || vendorValue < 0 || !requestedIds.Contains(id)) throw InvalidPublicItemResponse();
+                if (items.Any(item => item.Id == id)) throw InvalidPublicItemResponse();
+                items.Add(new Gw2PublicItem(
+                    id,
+                    string.IsNullOrWhiteSpace(name) ? null : name,
+                    type,
+                    rarity,
+                    level,
+                    vendorValue,
+                    PublicItemStrings(element, "flags"),
+                    PublicItemStrings(element, "game_types"),
+                    PublicItemStrings(element, "restrictions")));
+            }
+
+            return items;
+        }
+        catch (JsonException)
+        {
+            throw InvalidPublicItemResponse();
+        }
+    }
+
+    private static JsonElement PublicItemProperty(JsonElement item, string name)
+    {
+        var properties = item.EnumerateObject().Where(property => property.NameEquals(name)).ToArray();
+        return properties.Length == 1 ? properties[0].Value : throw InvalidPublicItemResponse();
+    }
+
+    private static long PublicItemLong(JsonElement item, string name)
+    {
+        var value = PublicItemProperty(item, name);
+        if (value.ValueKind != JsonValueKind.Number || !value.TryGetInt64(out var number)) throw InvalidPublicItemResponse();
+        return number;
+    }
+
+    private static string PublicItemString(JsonElement item, string name, bool allowBlank)
+    {
+        var value = PublicItemProperty(item, name);
+        if (value.ValueKind != JsonValueKind.String || (!allowBlank && string.IsNullOrWhiteSpace(value.GetString()))) throw InvalidPublicItemResponse();
+        return value.GetString()!;
+    }
+
+    private static IReadOnlyList<string> PublicItemStrings(JsonElement item, string name)
+    {
+        var value = PublicItemProperty(item, name);
+        if (value.ValueKind != JsonValueKind.Array) throw InvalidPublicItemResponse();
+        var strings = new List<string>();
+        foreach (var entry in value.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(entry.GetString())) throw InvalidPublicItemResponse();
+            strings.Add(entry.GetString()!);
+        }
+
+        return strings.Order(StringComparer.Ordinal).ToArray();
+    }
+
     private static void EnsureAuthenticatedOk(HttpResponseMessage response, string operation)
     {
         if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
@@ -1894,6 +2014,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidCurrentSellsResponse() => new("GW2 returned an invalid current-sells response. Try again later.");
     private static Gw2ConfigurationException InvalidCurrentSellsPagination() => new("GW2 returned invalid current-sells pagination metadata. Try again later.");
     private static Gw2ConfigurationException InvalidItemMetadataResponse() => new("GW2 returned an invalid item metadata response. Try again later.");
+    private static Gw2ConfigurationException InvalidPublicItemResponse() => new("GW2 returned an invalid public item response. Try again later.");
     private static Gw2ConfigurationException InvalidLegendaryArmoryResponse() => new("GW2 returned an invalid Legendary Armory response. Try again later.");
     private static Gw2ConfigurationException InvalidLegendaryArmoryMetadataResponse() => new("GW2 returned invalid Legendary Armory item metadata. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
@@ -2055,6 +2176,8 @@ public sealed record Gw2CurrentSells(IReadOnlyList<Gw2CurrentSellOrder> Orders);
 public sealed record Gw2CurrentSellOrder(long Id, long ItemId, long Price, long Quantity, DateTimeOffset Created);
 public sealed record Gw2Items(IReadOnlyList<Gw2Item> Items, IReadOnlyList<long> MissingItemIds);
 public sealed record Gw2Item(long Id, string Name);
+public sealed record Gw2PublicItems(IReadOnlyList<Gw2PublicItem> Items, IReadOnlyList<long> MissingItemIds, IReadOnlyList<string> Warnings);
+public sealed record Gw2PublicItem(long Id, string? Name, string Type, string Rarity, long Level, long VendorValue, IReadOnlyList<string> Flags, IReadOnlyList<string> GameTypes, IReadOnlyList<string> Restrictions);
 public sealed record Gw2LegendaryArmory(IReadOnlyList<Gw2LegendaryArmoryEntry> Entries, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
 public sealed record Gw2LegendaryArmoryEntry(long Id, long ArmoryCount, string? Name, string? Type, string? Subtype, string? WeightClass);
 public sealed record Gw2CharacterBuild(

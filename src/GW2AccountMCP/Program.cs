@@ -37,6 +37,7 @@ builder.Services
     .AddMcpServer()
     .WithHttpTransport(options => options.Stateless = true)
     .WithTools<FindItemsTool>()
+    .WithTools<GetItemsTool>()
     .WithTools<GetItemPricesTool>()
     .WithTools<ValueItemsTool>()
     .WithTools<GetAccountTool>()

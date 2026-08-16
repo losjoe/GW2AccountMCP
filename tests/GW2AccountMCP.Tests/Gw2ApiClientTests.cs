@@ -1972,6 +1972,113 @@ public sealed class Gw2ApiClientTests
     }
 
     [Fact]
+    public async Task GetPublicItemsAsync_returns_rich_caller_ordered_rows_without_authentication()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item","type":"FutureType","rarity":"FutureRarity","level":80,"vendor_value":123,"flags":["Zeta","Alpha"],"game_types":["Wvw","Pve"],"restrictions":[],"future_field":true},{"id":1,"name":"First Item","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[],"game_types":[],"restrictions":["Beta","Alpha"]}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        var items = await client.GetPublicItemsAsync([2, 1], CancellationToken.None);
+
+        Assert.Equal([2L, 1L], items.Items.Select(item => item.Id));
+        Assert.Equal(("Second Item", "FutureType", "FutureRarity", 80L, 123L), items.Items[0] is var first ? (first.Name, first.Type, first.Rarity, first.Level, first.VendorValue) : default);
+        Assert.Equal(["Alpha", "Zeta"], items.Items[0].Flags);
+        Assert.Equal(["Pve", "Wvw"], items.Items[0].GameTypes);
+        Assert.Equal(["Alpha", "Beta"], items.Items[1].Restrictions);
+        Assert.Empty(items.MissingItemIds);
+        Assert.Empty(items.Warnings);
+        Assert.Equal(["/v2/items?ids=2%2C1&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.Equal([null], handler.AuthorizationHeaders);
+    }
+
+    [Fact]
+    public async Task GetPublicItemsAsync_accepts_a_proper_partial_subset_and_normalizes_blank_names()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":" \t","type":"Armor","rarity":"Rare","level":1,"vendor_value":2,"flags":[],"game_types":[],"restrictions":[]}]""", HttpStatusCode.PartialContent));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var items = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test")).GetPublicItemsAsync([3, 2, 1], CancellationToken.None);
+
+        Assert.Equal([2L], items.Items.Select(item => item.Id));
+        Assert.Null(items.Items[0].Name);
+        Assert.Equal([3L, 1L], items.MissingItemIds);
+        Assert.Equal(["One or more returned public item names were blank and are represented as null."], items.Warnings);
+    }
+
+    [Fact]
+    public async Task GetPublicItemsAsync_treats_explicit_id_not_found_as_all_missing()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("private item payload", HttpStatusCode.NotFound));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var items = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test")).GetPublicItemsAsync([2, 1], CancellationToken.None);
+
+        Assert.Empty(items.Items);
+        Assert.Equal([2L, 1L], items.MissingItemIds);
+        Assert.Empty(items.Warnings);
+        Assert.Equal([null], handler.AuthorizationHeaders);
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidPublicItemIdBatches))]
+    public async Task GetPublicItemsAsync_rejects_invalid_batches_before_request(long[] itemIds)
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAnyAsync<ArgumentException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test")).GetPublicItemsAsync(itemIds, CancellationToken.None));
+
+        Assert.Empty(handler.RequestUris);
+    }
+
+    public static TheoryData<long[]> InvalidPublicItemIdBatches => new()
+    {
+        { [] }, { [0] }, { [-1] }, { [1, 1] }, { Enumerable.Range(1, 101).Select(id => (long)id).ToArray() }
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidPublicItemResponses))]
+    public async Task GetPublicItemsAsync_rejects_malformed_records_and_status_body_contradictions(ResponseSpec response)
+    {
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicItemsAsync([1, 2], CancellationToken.None));
+
+        Assert.Contains("public item", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static TheoryData<ResponseSpec> InvalidPublicItemResponses => new()
+    {
+        { new ResponseSpec("private body", HttpStatusCode.InternalServerError) },
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[],"game_types":[],"restrictions":[]}]""") },
+        { new ResponseSpec("[]", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[],"game_types":[],"restrictions":[]},{"id":2,"name":"Two","type":"Armor","rarity":"Fine","level":0,"vendor_value":0,"flags":[],"game_types":[],"restrictions":[]}]""", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[null],"game_types":[],"restrictions":[]}]""", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[" "],"game_types":[],"restrictions":[]}]""", HttpStatusCode.PartialContent) },
+        { new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":-1,"vendor_value":0,"flags":[],"game_types":[],"restrictions":[]}]""", HttpStatusCode.PartialContent) }
+    };
+
+    [Fact]
+    public async Task GetPublicItemsAsync_retries_transient_responses_and_propagates_caller_cancellation()
+    {
+        var handler = new RecordingHandler(new ResponseSpec("", HttpStatusCode.ServiceUnavailable), new ResponseSpec("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[],"game_types":[],"restrictions":[]}]"""));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await new Gw2ApiClient(httpClient, new Gw2ApiOptions(string.Empty, "https://example.test")).GetPublicItemsAsync([1], CancellationToken.None);
+
+        Assert.Equal(2, handler.RequestUris.Count);
+        Assert.All(handler.AuthorizationHeaders, value => Assert.Null(value));
+
+        using var cancellationSource = new CancellationTokenSource();
+        var cancellationHandler = new RecordingHandler("""[{"id":1,"name":"One","type":"Weapon","rarity":"Rare","level":0,"vendor_value":0,"flags":[],"game_types":[],"restrictions":[]}]""") { OnRequest = cancellationSource.Cancel };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(cancellationHttpClient, new Gw2ApiOptions(string.Empty, "https://example.test")).GetPublicItemsAsync([1], cancellationSource.Token));
+    }
+
+    [Fact]
     public async Task GetItemsAsync_requests_only_caller_ids_in_order_without_authentication()
     {
         var handler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Second Item"},{"id":1,"name":"First Item"}]"""));
