@@ -3267,6 +3267,317 @@ public sealed class Gw2ApiClientTests
     }
 
     private const string EquipmentPermissions = """{"permissions":["account","characters","builds","inventories"]}""";
+    [Fact]
+    public async Task GetAccountMasterySourcesAsync_preflights_required_scopes_and_reads_essential_sources_in_order()
+    {
+        var apiKey = new string('k', 16);
+        var handler = new RecordingHandler(
+            """{"permissions":["account","progression"]}""",
+            """[{"id":2,"level":1},{"id":1}]""",
+            """{"totals":[{"region":"Tyria","spent":2,"earned":5}],"unlocked":[1,2]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(apiKey, "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None);
+
+        Assert.Equal([(2L, 1L), (1L, (long?)null)], result.Tracks.Select(track => (track.Id, track.SourceLevel)));
+        Assert.Equal(("Tyria", 2L, 5L), Assert.Single(result.PointTotals) is var total ? (total.Region, total.Spent, total.Earned) : default);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/account/masteries?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/account/mastery/points?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.All(handler.AuthorizationHeaders, header => Assert.Equal("Bearer " + apiKey, header));
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.OK, "[{\"id\":1,\"name\":\"One\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":0,\"levels\":[]},{\"id\":2,\"name\":\"Two\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":1,\"levels\":[]}]", 0)]
+    [InlineData(HttpStatusCode.PartialContent, "[{\"id\":1,\"name\":\"One\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":0,\"levels\":[]}]", 1)]
+    [InlineData(HttpStatusCode.NotFound, "opaque non-json response", 2)]
+    public async Task GetPublicMasteriesAsync_accepts_selected_complete_partial_and_all_missing_responses(HttpStatusCode status, string body, int missingCount)
+    {
+        var handler = new RecordingHandler(new ResponseSpec(body, status));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1, 2], CancellationToken.None);
+
+        Assert.Equal(missingCount, result.MissingMasteryIds.Count);
+        Assert.Equal(["/v2/masteries?ids=1%2C2&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+        Assert.Equal([null], handler.AuthorizationHeaders);
+    }
+
+    [Theory]
+    [InlineData("[{\"id\":1},{\"id\":1}]")]
+    [InlineData("[{\"id\":1,\"level\":-1}]")]
+    public async Task GetAccountMasterySourcesAsync_rejects_invalid_essential_data_without_reading_points(string masteries)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", masteries);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None));
+
+        Assert.Equal(2, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetAccountMasterySourcesAsync_enforces_account_track_row_bounds_without_truncation()
+    {
+        var acceptedHandler = new RecordingHandler("""{"permissions":["account","progression"]}""", "[" + string.Join(',', Enumerable.Range(1, 200).Select(id => "{\"id\":" + id + "}")) + "]", """{"totals":[],"unlocked":[]}""");
+        using var acceptedClient = new HttpClient(acceptedHandler) { BaseAddress = new Uri("https://example.test") };
+        await new Gw2ApiClient(acceptedClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None);
+
+        var rejectedHandler = new RecordingHandler("""{"permissions":["account","progression"]}""", "[" + string.Join(',', Enumerable.Range(1, 201).Select(id => "{\"id\":" + id + "}")) + "]");
+        using var rejectedClient = new HttpClient(rejectedHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(rejectedClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("{\"permissions\":[\"account\"]}")]
+    [InlineData("{\"permissions\":[\"progression\"]}")]
+    public async Task GetAccountMasterySourcesAsync_requires_key_and_both_scopes_before_data(string permissions)
+    {
+        var handler = string.IsNullOrEmpty(permissions) ? new RecordingHandler() : new RecordingHandler(permissions);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(permissions == string.Empty ? string.Empty : new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None));
+
+        Assert.Equal(permissions == string.Empty ? 0 : 1, handler.RequestUris.Count);
+        Assert.DoesNotContain("kkkk", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("null")]
+    [InlineData("[null]")]
+    [InlineData("[{\"id\":0}]")]
+    [InlineData("[{\"id\":1,\"level\":null}]")]
+    [InlineData("[{\"id\":1,\"level\":1.5}]")]
+    public async Task GetAccountMasterySourcesAsync_validates_track_shape_and_omitted_level(string body)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", body, """{"totals":[],"unlocked":[]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+
+        if (body == "[]" || body.Contains("\"level\":null", StringComparison.Ordinal))
+        {
+            var result = await client.GetAccountMasterySourcesAsync(CancellationToken.None);
+            Assert.True(body == "[]" ? result.Tracks.Count == 0 : result.Tracks[0].SourceLevel is null);
+        }
+        else
+        {
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => client.GetAccountMasterySourcesAsync(CancellationToken.None));
+            Assert.Equal(2, handler.RequestUris.Count);
+        }
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"totals\":[],\"unlocked\":null}")]
+    [InlineData("{\"totals\":[{\"region\":\"Tyria\",\"spent\":1,\"earned\":1},{\"region\":\"Tyria\",\"spent\":1,\"earned\":1}],\"unlocked\":[]}")]
+    [InlineData("{\"totals\":[{\"region\":\" \",\"spent\":1,\"earned\":1}],\"unlocked\":[]}")]
+    [InlineData("{\"totals\":[{\"region\":\"Tyria\",\"spent\":-1,\"earned\":1}],\"unlocked\":[]}")]
+    [InlineData("{\"totals\":[],\"unlocked\":[0]}")]
+    public async Task GetAccountMasterySourcesAsync_validates_point_shapes_and_private_values(string points)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", "[]", points);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None));
+        Assert.DoesNotContain(points, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetAccountMasterySourcesAsync_captures_distinct_completion_times_after_each_source()
+    {
+        var provider = new SequenceTimeProvider();
+        var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", "[]", """{"totals":[],"unlocked":[]}""");
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"), provider).GetAccountMasterySourcesAsync(CancellationToken.None);
+
+        Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:00Z"), result.AccountMasteriesAsOf);
+        Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:01Z"), result.MasteryPointsAsOf);
+    }
+
+    [Fact]
+    public async Task GetPublicMasteriesAsync_validates_local_arguments_before_network()
+    {
+        var handler = new RecordingHandler();
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var client = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+        foreach (var ids in new IReadOnlyList<long>?[] { null, [], [0], [1, 1], Enumerable.Range(1, 201).Select(id => (long)id).ToArray() })
+        {
+            await Assert.ThrowsAnyAsync<ArgumentException>(() => client.GetPublicMasteriesAsync(ids!, CancellationToken.None));
+        }
+        Assert.Empty(handler.RequestUris);
+
+        var acceptedHandler = new RecordingHandler(new ResponseSpec("opaque", HttpStatusCode.NotFound));
+        using var acceptedHttpClient = new HttpClient(acceptedHandler) { BaseAddress = new Uri("https://example.test") };
+        var accepted = await new Gw2ApiClient(acceptedHttpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync(Enumerable.Range(1, 200).Select(id => (long)id).ToArray(), CancellationToken.None);
+        Assert.Equal(200, accepted.MissingMasteryIds.Count);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.OK, "[]")]
+    [InlineData(HttpStatusCode.OK, "[{\"id\":3,\"name\":\"Three\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":0,\"levels\":[]}]")]
+    [InlineData(HttpStatusCode.PartialContent, "[]")]
+    [InlineData(HttpStatusCode.PartialContent, "[{\"id\":1,\"name\":\"One\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":0,\"levels\":[]},{\"id\":2,\"name\":\"Two\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":0,\"levels\":[]}]")]
+    public async Task GetPublicMasteriesAsync_rejects_invalid_status_membership_combinations(HttpStatusCode status, string body)
+    {
+        var handler = new RecordingHandler(new ResponseSpec(body, status));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1, 2], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Mastery_sources_enforce_exact_and_plus_one_body_bounds()
+    {
+        foreach (var (source, maximum, accountBody, pointsBody) in new[]
+        {
+            ("masteries", 256 * 1024, true, false),
+            ("points", 1024 * 1024, false, true)
+        })
+        {
+            foreach (var bytes in new[] { maximum, maximum + 1 })
+            {
+                var masteries = accountBody ? PaddedJson("[{\"id\":1,\"extra\":\"", "\"}]", bytes) : "[]";
+                var points = pointsBody ? PaddedJson("{\"totals\":[],\"unlocked\":[],\"extra\":\"", "\"}", bytes) : """{"totals":[],"unlocked":[]}""";
+                var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", masteries, points);
+                using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+                var call = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None);
+                if (bytes == maximum) await call; else await Assert.ThrowsAsync<Gw2ConfigurationException>(() => call);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task GetPublicMasteriesAsync_consumes_bounded_opaque_404_bodies()
+    {
+        foreach (var bytes in new[] { 2 * 1024 * 1024, 2 * 1024 * 1024 + 1 })
+        {
+            var handler = new RecordingHandler(new ResponseSpec(new string('x', bytes), HttpStatusCode.NotFound));
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var call = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1], CancellationToken.None);
+            if (bytes == 2 * 1024 * 1024) Assert.Single((await call).MissingMasteryIds); else await Assert.ThrowsAsync<Gw2ConfigurationException>(() => call);
+        }
+    }
+
+    [Fact]
+    public async Task GetAccountMasterySourcesAsync_enforces_point_total_raw_entry_and_region_boundaries()
+    {
+        foreach (var (totals, unlocked, region, succeeds) in new[] { (32, 10_000, new string('r', 64), true), (33, 0, "Tyria", false), (0, 10_001, "Tyria", false), (1, 0, new string('r', 65), false) })
+        {
+            var totalRows = string.Join(',', Enumerable.Range(1, totals).Select(id => "{\"region\":\"" + (totals == 1 ? region : id.ToString()) + "\",\"spent\":0,\"earned\":0}"));
+            var points = "{\"totals\":[" + totalRows + "],\"unlocked\":[" + string.Join(',', Enumerable.Repeat("1", unlocked)) + "]}";
+            var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", "[]", points);
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var call = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None);
+            if (succeeds) await call; else await Assert.ThrowsAsync<Gw2ConfigurationException>(() => call);
+        }
+    }
+
+    [Fact]
+    public async Task GetPublicMasteriesAsync_validates_retained_fields_and_nested_level_boundaries()
+    {
+        var validLevel = "{\"name\":\"Level\",\"description\":\"\",\"instruction\":\"\",\"point_cost\":0,\"exp_cost\":0}";
+        foreach (var (levels, succeeds) in new[] { (2048, true), (2049, false) })
+        {
+            var body = PublicMasteryJson("Tyria", "Name", "", string.Join(',', Enumerable.Repeat(validLevel, levels)));
+            var handler = new RecordingHandler(body);
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var call = new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1], CancellationToken.None);
+            if (succeeds) await call; else await Assert.ThrowsAsync<Gw2ConfigurationException>(() => call);
+        }
+
+        foreach (var body in InvalidPublicMasteryBodies())
+        {
+            var handler = new RecordingHandler(body);
+            using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1], CancellationToken.None));
+        }
+
+        var maximum = PublicMasteryJson(new string('r', 64), new string('n', 256), new string('q', 2048), "{\"name\":\"" + new string('l', 256) + "\",\"description\":\"" + new string('d', 4096) + "\",\"instruction\":\"" + new string('i', 4096) + "\",\"point_cost\":0,\"exp_cost\":0}");
+        var maximumHandler = new RecordingHandler(maximum);
+        using var maximumClient = new HttpClient(maximumHandler) { BaseAddress = new Uri("https://example.test") };
+        await new Gw2ApiClient(maximumClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1], CancellationToken.None);
+    }
+
+    private static IEnumerable<string> InvalidPublicMasteryBodies()
+    {
+        yield return "[{}]";
+        yield return PublicMasteryJson(" ", "Name", "", "");
+        yield return PublicMasteryJson("Tyria", new string('n', 257), "", "");
+        yield return PublicMasteryJson(new string('r', 65), "Name", "", "");
+        yield return PublicMasteryJson("Tyria", "Name", new string('q', 2049), "");
+        yield return "[{\"id\":1,\"name\":\"Name\",\"requirement\":\"\",\"region\":\"Tyria\",\"order\":1.5,\"levels\":[]}]";
+        yield return PublicMasteryJson("Tyria", "Name", "", "{\"name\":\"\",\"description\":\"\",\"instruction\":\"\",\"point_cost\":0,\"exp_cost\":0}");
+        yield return PublicMasteryJson("Tyria", "Name", "", "{\"name\":\"Level\",\"description\":\"\",\"instruction\":\"\",\"point_cost\":-1,\"exp_cost\":0}");
+        yield return PublicMasteryJson("Tyria", "Name", "", "{\"name\":\"Level\",\"description\":\"" + new string('d', 4097) + "\",\"instruction\":\"\",\"point_cost\":0,\"exp_cost\":0}");
+        yield return PublicMasteryJson("Tyria", "Name", "", "{\"name\":\"" + new string('l', 257) + "\",\"description\":\"\",\"instruction\":\"\",\"point_cost\":0,\"exp_cost\":0}");
+        yield return PublicMasteryJson("Tyria", "Name", "", "{\"name\":\"Level\",\"description\":\"\",\"instruction\":\"" + new string('i', 4097) + "\",\"point_cost\":0,\"exp_cost\":0}");
+    }
+
+    private static string PublicMasteryJson(string region, string name, string requirement, string levels) => "[{\"id\":1,\"name\":\"" + name + "\",\"requirement\":\"" + requirement + "\",\"region\":\"" + region + "\",\"order\":0,\"levels\":[" + levels + "],\"future\":true}]";
+
+    [Theory]
+    [InlineData(HttpStatusCode.Forbidden, true)]
+    [InlineData(HttpStatusCode.InternalServerError, false)]
+    public async Task GetAccountMasterySourcesAsync_stops_on_each_essential_failure_without_private_details(HttpStatusCode status, bool failFirst)
+    {
+        var privateBody = "private-mastery-body";
+        var handler = failFirst
+            ? new RecordingHandler("""{"permissions":["account","progression"]}""", new ResponseSpec(privateBody, status))
+            : new RecordingHandler("""{"permissions":["account","progression"]}""", "[]", new ResponseSpec(privateBody, status));
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(CancellationToken.None));
+        Assert.Equal(failFirst ? 2 : 3, handler.RequestUris.Count);
+        Assert.DoesNotContain(privateBody, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Mastery_calls_propagate_caller_cancellation_without_following_requests()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var essentialHandler = new RecordingHandler("""{"permissions":["account","progression"]}""") { OnRequest = cancellation.Cancel };
+        using var essentialClient = new HttpClient(essentialHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(essentialClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetAccountMasterySourcesAsync(cancellation.Token));
+        Assert.Single(essentialHandler.RequestUris);
+
+        using var publicCancellation = new CancellationTokenSource();
+        var publicHandler = new RecordingHandler("[]") { OnRequest = publicCancellation.Cancel };
+        using var publicClient = new HttpClient(publicHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(publicClient, new Gw2ApiOptions(new string('k', 16), "https://example.test")).GetPublicMasteriesAsync([1], publicCancellation.Token));
+        Assert.Single(publicHandler.RequestUris);
+    }
+
+    [Fact]
+    public async Task Mastery_owned_deadlines_cover_post_header_body_consumption()
+    {
+        var essentialProvider = new DeferredTimerTimeProvider();
+        var essentialHandler = new RecordingHandler("""{"permissions":["account","progression"]}""", new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(essentialProvider) });
+        using var essentialClient = new HttpClient(essentialHandler) { BaseAddress = new Uri("https://example.test") };
+        var essentialError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(essentialClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"), essentialProvider).GetAccountMasterySourcesAsync(CancellationToken.None));
+        Assert.True(essentialProvider.Fired);
+        Assert.Contains("timed out", essentialError.Message, StringComparison.OrdinalIgnoreCase);
+
+        var publicProvider = new DeferredTimerTimeProvider();
+        var publicHandler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StallingHttpContent(publicProvider) });
+        using var publicClient = new HttpClient(publicHandler) { BaseAddress = new Uri("https://example.test") };
+        var publicError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(publicClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"), publicProvider).GetPublicMasteriesAsync([1], CancellationToken.None));
+        Assert.True(publicProvider.Fired);
+        Assert.Contains("timed out", publicError.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetAccountMasterySourcesAsync_owned_deadline_covers_tokeninfo_body_after_headers()
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var handler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(timeProvider) });
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions(new string('k', 16), "https://example.test"), timeProvider).GetAccountMasterySourcesAsync(CancellationToken.None));
+
+        Assert.True(timeProvider.Fired);
+        Assert.Contains("timed out", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(handler.RequestUris);
+    }
+
+    private static string PaddedJson(string prefix, string suffix, int bytes) => prefix + new string('x', bytes - Encoding.UTF8.GetByteCount(prefix) - Encoding.UTF8.GetByteCount(suffix)) + suffix;
     private const string EquipmentRoster = """["Synthetic Hero"]""";
     private static RecordingHandler InventoryHandler(string inventory, params object[] publicResponses) => new([
         """{"permissions":["account","characters","inventories"]}""", """["Synthetic Hero"]""", inventory,
@@ -4191,6 +4502,12 @@ public sealed class Gw2ApiClientTests
             Fired = true;
             callback(state);
         }
+    }
+
+    private sealed class SequenceTimeProvider : TimeProvider
+    {
+        private int calls;
+        public override DateTimeOffset GetUtcNow() => DateTimeOffset.Parse("2026-08-16T12:00:00Z").AddSeconds(calls++);
     }
 
     private sealed class DeferredTimer : ITimer

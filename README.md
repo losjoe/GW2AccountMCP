@@ -4,7 +4,7 @@ Local, read-only Guild Wars 2 account facts over stateless Streamable HTTP MCP.
 
 ## Current scope
 
-The server exposes fifteen tools:
+The server exposes sixteen tools:
 
 - `find_items` resolves a bounded English item-name fragment from the generated local public cache. It returns exact matches before contains matches with canonical ID, name, type, rarity, level, and match kind. It does not call the GW2 API at request time or choose among ambiguous names.
 - `get_items` accepts 1-100 distinct positive canonical item IDs and makes one unauthenticated public `/v2/items` request at runtime. It returns caller-ordered item facts—nullable name, type, rarity, level, vendor value, flags, game types, and restrictions—with explicit unavailable-resource rows and nullable source facts when a requested public item resource is absent. Optional `includeMaterialCategories: true` adds one unauthenticated `/v2/materials?ids=all` request and compact per-item public category memberships sorted by category order then ID. `NotRequested` and `Unavailable` use explicit null category data; `Available` uses non-null lists, where `[]` means the complete material response reported no membership. Material failure preserves item facts and item completeness. Item `asOf` and nullable `materialCategoriesAsOf` are independent response-completion observations, and `isAtomicSnapshot: false` discloses that the sources are not one atomic snapshot. The tool does not use account data, caches, recipes, or Trading Post prices.
@@ -13,6 +13,7 @@ The server exposes fifteen tools:
 - `value_items` accepts 1-100 caller-ordered distinct positive canonical item IDs with quantities from 1 through `Int32.MaxValue`. From exactly one local price snapshot, it returns nullable best-price factual arithmetic for each row: highest-buy immediate-sale gross, independent 5% listing and 10% exchange fees, and net; lowest-sell buyer cost; and lowest-sell hypothetical-listing gross, fees, and net. Each positive-gross fee is independently rounded half up on that row's aggregate gross and is at least one copper. The three aggregate views return numeric totals only when every requested row has its required quote; otherwise they are explicitly incomplete with null totals and caller-order missing IDs. Best-price values are quote extrapolations without best-level volume, depth, liquidity, or execution guarantees. It does not calculate recipe costs and makes no buy, sell, craft, keep, profit, flip, trend, forecast, velocity, history, or other recommendation.
 - `get_account` validates the configured key through `/v2/tokeninfo`, requires `account`, and returns basic account facts with an `asOf` timestamp.
 - `get_achievement_progress` accepts 1-20 caller-ordered distinct positive achievement IDs, requires `account` and `progression` for the complete account progress list, then makes one separate optional public English `/v2/achievements` explicit-ID lookup. It returns requested rows only, explicit account-absence and public-definition states/nulls, completed account bit indexes with compact resolved public bit details where available, independent source completion times, bounded warnings, and `isAtomicSnapshot: false`. Public definition failure retains account facts as `PublicDefinitionsUnavailable`; it does not scan the achievement catalog or return categories, groups, tiers, rewards, or recommendations.
+- `get_mastery_progress` takes no arguments, requires `account` and `progression`, and sequentially reads complete bounded account mastery tracks and mastery-point totals. When account tracks are nonempty, it makes one optional public English `/v2/masteries` lookup for those ascending explicit IDs. It returns canonical track and ordinal-region point-total order, explicit metadata states/nulls, separate source completion observations, bounded warnings, and `isAtomicSnapshot: false`. `sourceLevel` uses this tool's product-owned zero-based highest-trained-level interpretation; omitted account rows or levels do not infer unstarted state. Public metadata failure preserves authenticated facts. It excludes raw unlocked point IDs, public catalog rows, point labels, full level catalogs, region mappings, recommendations, and planning.
 - `get_character_build` accepts one exact character name from `get_characters`, requires `account`, `characters`, and `builds`, verifies that name against the complete roster, and returns only that character's active build tab. It preserves fixed specialization, trait, terrestrial/aquatic skill, Ranger pet, and Revenant legend slots; resolves referenced public metadata to compact names where available; and retains unresolved IDs with deterministic warnings and `isMetadataComplete: false`. It does not return inventory, equipment, inactive tabs, or ownership quantities.
 - `get_character_equipment` accepts one exact character name from `get_characters`, requires `account`, `characters`, `builds`, and `inventories`, and returns that character's active PvE/WvW combat-equipment references. It uses the active equipment tab plus a conditional current-equipment lookup for the API's missing Relic, resolves compact item, prefix, upgrade, infusion, and skin metadata, preserves unresolved canonical IDs with warnings, and explicitly marks the result as non-ownership data. It includes terrestrial and aquatic combat slots but excludes PvP, dyes, gathering, fishing, Jade Bot equipment, inventory, inactive tabs, quantities, and Legendary Armory ownership.
 - `get_character_inventory` accepts one exact character name from `get_characters`, requires `account`, `characters`, and `inventories`, and returns that character's complete bounded physical equipped-bag layout. It preserves zero-based bag and slot positions, absent bags, empty slots, per-slot stack counts and charges, binding, selected/default stats, upgrades, infusions, and skins, with compact public names where available and deterministic metadata warnings otherwise. Its physical stack counts are already represented by `get_account_holdings` character-bag contributions and must not be added as a second ownership source; it returns no per-item totals and excludes account storage, equipment references, inactive tabs, and Legendary Armory ownership.
@@ -141,7 +142,48 @@ in
     RenamedColumns
 ```
 
-After a successful production cache refresh, use Excel Refresh All and save the workbook. Refresh All still runs the workbook's existing direct GW2/Trading Post queries, so it must not overlap MCP, the updater, or another bulk GW2 client. The updater does not automate or modify the workbook.
+### Excel `GetListings` query
+
+Replace the existing Excel Power Query named `GetListings` with the following query. Adjust `CacheDirectory` only if the production cache is elsewhere. This reads the price manifest's committed generation and preserves the downstream `id`, `Highest Buy Price`, `Demand`, `Lowest Sell Price`, and `Supply` columns. `GetListings` no longer invokes the paged `Listings` function or `NumListings`.
+
+```powerquery
+let
+    CacheDirectory = "D:\Code\GW2AccountMCP\data\public-cache",
+    Manifest = Json.Document(File.Contents(CacheDirectory & "\prices.manifest.json")),
+    CsvFileName = Text.From(Record.Field(Manifest, "csvFileName")),
+    Source = Csv.Document(
+        File.Contents(CacheDirectory & "\" & CsvFileName),
+        [Delimiter = ",", Columns = 6, Encoding = 65001, QuoteStyle = QuoteStyle.Csv]
+    ),
+    PromotedHeaders = Table.PromoteHeaders(Source, [PromoteAllScalars = true]),
+    SelectedColumns = Table.SelectColumns(
+        PromotedHeaders,
+        {"id", "buyUnitPrice", "buyQuantity", "sellUnitPrice", "sellQuantity"}
+    ),
+    TypedRows = Table.TransformColumnTypes(
+        SelectedColumns,
+        {
+            {"id", Int64.Type},
+            {"buyUnitPrice", Int64.Type},
+            {"buyQuantity", Int64.Type},
+            {"sellUnitPrice", Int64.Type},
+            {"sellQuantity", Int64.Type}
+        }
+    ),
+    RenamedColumns = Table.RenameColumns(
+        TypedRows,
+        {
+            {"buyUnitPrice", "Highest Buy Price"},
+            {"buyQuantity", "Demand"},
+            {"sellUnitPrice", "Lowest Sell Price"},
+            {"sellQuantity", "Supply"}
+        }
+    )
+in
+    RenamedColumns
+```
+
+After a successful production cache refresh, use Excel Refresh All and save the workbook. The cache updater and Excel read the generation selected by the manifest; the updater does not automate or modify the workbook. Any remaining direct GW2 API queries in the workbook must not overlap MCP, the updater, or another bulk GW2 client.
 
 From the repository root:
 
@@ -187,7 +229,7 @@ With the server running, use the current official Inspector CLI flow to list too
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/list
 ```
 
-Then invoke a tool through Inspector. Account-backed tools need a locally configured valid GW2 key with the required scopes; do not paste it into Inspector arguments or chat. `find_items`, `get_item_prices`, and `value_items` use only local public caches; `get_items` and default `get_recipes` calls are public and request-time, while `get_recipes` with `includeAccountUnlocks: true` additionally requires `account` and `unlocks`. `get_achievement_progress` requires `account` and `progression` and accepts canonical achievement IDs. `get_trading_post_activity` accepts `CurrentBuys` or `CurrentSells` and requires `account` and `tradingpost`. Holdings still accepts canonical IDs, so resolve names first when needed.
+Then invoke a tool through Inspector. Account-backed tools need a locally configured valid GW2 key with the required scopes; do not paste it into Inspector arguments or chat. `find_items`, `get_item_prices`, and `value_items` use only local public caches; `get_items` and default `get_recipes` calls are public and request-time, while `get_recipes` with `includeAccountUnlocks: true` additionally requires `account` and `unlocks`. `get_achievement_progress` requires `account` and `progression` and accepts canonical achievement IDs. `get_mastery_progress` takes no arguments and requires `account` and `progression`. `get_trading_post_activity` accepts `CurrentBuys` or `CurrentSells` and requires `account` and `tradingpost`. Holdings still accepts canonical IDs, so resolve names first when needed.
 
 ```powershell
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name find_items --tool-args-json '{"query":"Mystic Coin"}' --format json
@@ -197,6 +239,7 @@ npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport 
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name value_items --tool-args-json '{"items":[{"itemId":19976,"quantity":3}]}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_achievement_progress --tool-args-json '{"achievementIds":[1,2]}' --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_mastery_progress --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_build --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_equipment --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_inventory --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
@@ -218,4 +261,4 @@ Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create
 tunnel-client init --sample sample_mcp_remote_no_auth --profile gw2-account --tunnel-id <tunnel-id> --mcp-server-url http://127.0.0.1:5288/mcp
 ```
 
-Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly fifteen tools are discovered: `find_items`, `get_items`, `get_recipes`, `get_item_prices`, `value_items`, `get_account`, `get_account_holdings`, `get_achievement_progress`, `get_trading_post_activity`, `get_character_build`, `get_character_equipment`, `get_character_inventory`, `get_characters`, `get_legendary_armory`, and `get_wallet`. Keep the launcher running while using the app.
+Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly sixteen tools are discovered: `find_items`, `get_items`, `get_recipes`, `get_item_prices`, `value_items`, `get_account`, `get_account_holdings`, `get_achievement_progress`, `get_mastery_progress`, `get_trading_post_activity`, `get_character_build`, `get_character_equipment`, `get_character_inventory`, `get_characters`, `get_legendary_armory`, and `get_wallet`. Keep the launcher running while using the app.

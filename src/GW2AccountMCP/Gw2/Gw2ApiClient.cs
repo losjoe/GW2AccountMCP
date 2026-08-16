@@ -31,6 +31,8 @@ public interface IGw2ApiClient
     Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken);
     Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken);
     Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken);
+    Task<Gw2AccountMasterySources> GetAccountMasterySourcesAsync(CancellationToken cancellationToken);
+    Task<Gw2PublicMasteries> GetPublicMasteriesAsync(IReadOnlyList<long> masteryIds, CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
@@ -56,6 +58,14 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const int MaximumAccountAchievementPayloadBytes = 4 * 1024 * 1024;
     private const int MaximumAccountAchievementRows = 20_000;
     private const int MaximumPublicAchievementPayloadBytes = 1024 * 1024;
+    private const int MaximumAccountMasteryPayloadBytes = 256 * 1024;
+    private const int MaximumAccountMasteryRows = 200;
+    private const int MaximumMasteryPointsPayloadBytes = 1024 * 1024;
+    private const int MaximumMasteryPointTotals = 32;
+    private const int MaximumMasteryUnlockedEntries = 10_000;
+    private const int MaximumPublicMasteryPayloadBytes = 2 * 1024 * 1024;
+    private const int MaximumPublicMasteryBatchSize = 200;
+    private const int MaximumPublicMasteryLevels = 2_048;
     private const int MaximumEquipmentRows = 32;
     private const int MaximumEquipmentReferences = 200;
     private const int MaximumEquipmentStatAttributes = 32;
@@ -892,6 +902,179 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         catch (IOException) { throw InvalidPublicAchievementResponse(); }
         catch (JsonException) { throw InvalidPublicAchievementResponse(); }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new Gw2ConfigurationException("GW2 public achievement-definition request timed out. Try again later."); }
+    }
+
+    public async Task<Gw2AccountMasterySources> GetAccountMasterySourcesAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey)) throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        try
+        {
+            using var permissionsRequest = await SendAchievementWithSingleRetryAsync("/v2/tokeninfo", cancellationToken, authenticated: true);
+            if (permissionsRequest.Response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
+            if (!permissionsRequest.Response.IsSuccessStatusCode)
+            {
+                throw new Gw2ConfigurationException($"GW2 key validation failed with HTTP {(int)permissionsRequest.Response.StatusCode}. Try again later.");
+            }
+
+            var tokenInfo = await DeserializeTokenInfoAsync(permissionsRequest.Response, permissionsRequest.CancellationToken);
+            foreach (var requiredPermission in new[] { "account", "progression" })
+            {
+                if (!tokenInfo.Permissions!.Contains(requiredPermission, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new Gw2ConfigurationException($"GW2_API_KEY is missing the required {requiredPermission} permission. Create a key with the {requiredPermission} permission.");
+                }
+            }
+
+            using var masteriesRequest = await SendAchievementWithSingleRetryAsync("/v2/account/masteries", cancellationToken, authenticated: true);
+            EnsureMasteryAuthenticatedOk(masteriesRequest.Response, "account masteries");
+            var tracks = await DeserializeAccountMasteriesAsync(masteriesRequest.Response, masteriesRequest.CancellationToken);
+            var masteriesAsOf = (timeProvider ?? TimeProvider.System).GetUtcNow();
+            using var pointsRequest = await SendAchievementWithSingleRetryAsync("/v2/account/mastery/points", cancellationToken, authenticated: true);
+            EnsureMasteryAuthenticatedOk(pointsRequest.Response, "mastery points");
+            var pointTotals = await DeserializeMasteryPointsAsync(pointsRequest.Response, pointsRequest.CancellationToken);
+            return new Gw2AccountMasterySources(tracks, pointTotals, masteriesAsOf, (timeProvider ?? TimeProvider.System).GetUtcNow());
+        }
+        catch (IOException) { throw InvalidAccountMasteryResponse(); }
+        catch (JsonException) { throw InvalidAccountMasteryResponse(); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new Gw2ConfigurationException("GW2 account mastery request timed out. Try again later."); }
+    }
+
+    public async Task<Gw2PublicMasteries> GetPublicMasteriesAsync(IReadOnlyList<long> masteryIds, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(masteryIds);
+        if (masteryIds.Count is 0 or > MaximumPublicMasteryBatchSize || masteryIds.Any(id => id <= 0) || masteryIds.Distinct().Count() != masteryIds.Count)
+        {
+            throw new ArgumentException("Mastery IDs must contain 1 to 200 unique positive values.", nameof(masteryIds));
+        }
+
+        try
+        {
+            using var request = await SendAchievementWithSingleRetryAsync($"/v2/masteries?ids={Uri.EscapeDataString(string.Join(',', masteryIds))}", cancellationToken, authenticated: false);
+            if (request.Response.StatusCode == HttpStatusCode.NotFound)
+            {
+                await ReadAchievementBodyAsync(request.Response.Content, MaximumPublicMasteryPayloadBytes, InvalidPublicMasteryResponse, request.CancellationToken);
+                return new Gw2PublicMasteries([], masteryIds.ToArray());
+            }
+            if (request.Response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent)
+            {
+                throw new Gw2ConfigurationException($"GW2 public mastery request failed with HTTP {(int)request.Response.StatusCode}. Try again later.");
+            }
+
+            var rows = await DeserializePublicMasteriesAsync(request.Response, masteryIds.ToHashSet(), request.CancellationToken);
+            var byId = rows.ToDictionary(row => row.Id);
+            var missing = masteryIds.Where(id => !byId.ContainsKey(id)).ToArray();
+            if ((request.Response.StatusCode == HttpStatusCode.OK && missing.Length != 0)
+                || (request.Response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || missing.Length == 0)))
+            {
+                throw InvalidPublicMasteryResponse();
+            }
+            return new Gw2PublicMasteries(masteryIds.Where(byId.ContainsKey).Select(id => byId[id]).ToArray(), missing);
+        }
+        catch (IOException) { throw InvalidPublicMasteryResponse(); }
+        catch (JsonException) { throw InvalidPublicMasteryResponse(); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new Gw2ConfigurationException("GW2 public mastery request timed out. Try again later."); }
+    }
+
+    private async Task<IReadOnlyList<Gw2AccountMasteryTrack>> DeserializeAccountMasteriesAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        using var document = JsonDocument.Parse(await ReadAchievementBodyAsync(response.Content, MaximumAccountMasteryPayloadBytes, InvalidAccountMasteryResponse, cancellationToken));
+        if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() > MaximumAccountMasteryRows) throw InvalidAccountMasteryResponse();
+        var ids = new HashSet<long>();
+        var tracks = new List<Gw2AccountMasteryTrack>();
+        foreach (var value in document.RootElement.EnumerateArray())
+        {
+            var row = MasteryObject(value, InvalidAccountMasteryResponse);
+            var id = MasteryPositiveLong(row, "id", InvalidAccountMasteryResponse);
+            if (!ids.Add(id)) throw InvalidAccountMasteryResponse();
+            tracks.Add(new Gw2AccountMasteryTrack(id, MasteryOptionalNonnegativeLong(row, "level", InvalidAccountMasteryResponse)));
+        }
+        return tracks;
+    }
+
+    private async Task<IReadOnlyList<Gw2MasteryPointTotal>> DeserializeMasteryPointsAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        using var document = JsonDocument.Parse(await ReadAchievementBodyAsync(response.Content, MaximumMasteryPointsPayloadBytes, InvalidMasteryPointsResponse, cancellationToken));
+        var root = MasteryObject(document.RootElement, InvalidMasteryPointsResponse);
+        var totals = MasteryArray(root, "totals", InvalidMasteryPointsResponse);
+        var unlocked = MasteryArray(root, "unlocked", InvalidMasteryPointsResponse);
+        if (totals.GetArrayLength() > MaximumMasteryPointTotals || unlocked.GetArrayLength() > MaximumMasteryUnlockedEntries) throw InvalidMasteryPointsResponse();
+        foreach (var entry in unlocked.EnumerateArray()) if (entry.ValueKind != JsonValueKind.Number || !entry.TryGetInt64(out var id) || id <= 0) throw InvalidMasteryPointsResponse();
+        var regions = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<Gw2MasteryPointTotal>();
+        foreach (var value in totals.EnumerateArray())
+        {
+            var row = MasteryObject(value, InvalidMasteryPointsResponse);
+            var region = MasteryRequiredString(row, "region", false, 64, InvalidMasteryPointsResponse);
+            if (!regions.Add(region)) throw InvalidMasteryPointsResponse();
+            result.Add(new Gw2MasteryPointTotal(region, MasteryNonnegativeLong(row, "spent", InvalidMasteryPointsResponse), MasteryNonnegativeLong(row, "earned", InvalidMasteryPointsResponse)));
+        }
+        return result;
+    }
+
+    private async Task<IReadOnlyList<Gw2PublicMastery>> DeserializePublicMasteriesAsync(HttpResponseMessage response, IReadOnlySet<long> requestedIds, CancellationToken cancellationToken)
+    {
+        using var document = JsonDocument.Parse(await ReadAchievementBodyAsync(response.Content, MaximumPublicMasteryPayloadBytes, InvalidPublicMasteryResponse, cancellationToken));
+        if (document.RootElement.ValueKind != JsonValueKind.Array) throw InvalidPublicMasteryResponse();
+        var ids = new HashSet<long>();
+        var levelsTotal = 0;
+        var rows = new List<Gw2PublicMastery>();
+        foreach (var value in document.RootElement.EnumerateArray())
+        {
+            var row = MasteryObject(value, InvalidPublicMasteryResponse);
+            var id = MasteryPositiveLong(row, "id", InvalidPublicMasteryResponse);
+            if (!requestedIds.Contains(id) || !ids.Add(id)) throw InvalidPublicMasteryResponse();
+            var levels = MasteryArray(row, "levels", InvalidPublicMasteryResponse);
+            levelsTotal = checked(levelsTotal + levels.GetArrayLength());
+            if (levelsTotal > MaximumPublicMasteryLevels) throw InvalidPublicMasteryResponse();
+            rows.Add(new Gw2PublicMastery(id,
+                MasteryRequiredString(row, "name", false, 256, InvalidPublicMasteryResponse),
+                MasteryRequiredString(row, "requirement", true, 2048, InvalidPublicMasteryResponse),
+                MasteryRequiredString(row, "region", false, 64, InvalidPublicMasteryResponse),
+                MasteryLong(row, "order", InvalidPublicMasteryResponse),
+                levels.EnumerateArray().Select(level => ParsePublicMasteryLevel(level)).ToArray()));
+        }
+        return rows;
+    }
+
+    private static Gw2PublicMasteryLevel ParsePublicMasteryLevel(JsonElement value)
+    {
+        var row = MasteryObject(value, InvalidPublicMasteryResponse);
+        return new Gw2PublicMasteryLevel(
+            MasteryRequiredString(row, "name", false, 256, InvalidPublicMasteryResponse),
+            MasteryRequiredString(row, "description", true, 4096, InvalidPublicMasteryResponse),
+            MasteryRequiredString(row, "instruction", true, 4096, InvalidPublicMasteryResponse),
+            MasteryNonnegativeLong(row, "point_cost", InvalidPublicMasteryResponse),
+            MasteryNonnegativeLong(row, "exp_cost", InvalidPublicMasteryResponse));
+    }
+
+    private static void EnsureMasteryAuthenticatedOk(HttpResponseMessage response, string source)
+    {
+        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
+        if (response.StatusCode != HttpStatusCode.OK) throw new Gw2ConfigurationException($"GW2 {source} request failed with HTTP {(int)response.StatusCode}. Try again later.");
+    }
+
+    private static JsonElement MasteryObject(JsonElement value, Func<Gw2ConfigurationException> invalid) => value.ValueKind == JsonValueKind.Object ? value : throw invalid();
+    private static bool TryMasteryProperty(JsonElement value, string name, Func<Gw2ConfigurationException> invalid, out JsonElement property)
+    {
+        var properties = value.EnumerateObject().Where(candidate => candidate.NameEquals(name)).ToArray();
+        if (properties.Length > 1) throw invalid();
+        property = properties.Length == 1 ? properties[0].Value : default;
+        return properties.Length == 1;
+    }
+    private static JsonElement MasteryProperty(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => TryMasteryProperty(value, name, invalid, out var property) ? property : throw invalid();
+    private static JsonElement MasteryArray(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => MasteryProperty(value, name, invalid).ValueKind == JsonValueKind.Array ? MasteryProperty(value, name, invalid) : throw invalid();
+    private static long MasteryLong(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => MasteryProperty(value, name, invalid).ValueKind == JsonValueKind.Number && MasteryProperty(value, name, invalid).TryGetInt64(out var number) ? number : throw invalid();
+    private static long MasteryPositiveLong(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => MasteryLong(value, name, invalid) is var number && number > 0 ? number : throw invalid();
+    private static long MasteryNonnegativeLong(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => MasteryLong(value, name, invalid) is var number && number >= 0 ? number : throw invalid();
+    private static long? MasteryOptionalNonnegativeLong(JsonElement value, string name, Func<Gw2ConfigurationException> invalid)
+    {
+        if (!TryMasteryProperty(value, name, invalid, out var property) || property.ValueKind == JsonValueKind.Null) return null;
+        return property.ValueKind == JsonValueKind.Number && property.TryGetInt64(out var number) && number >= 0 ? number : throw invalid();
+    }
+    private static string MasteryRequiredString(JsonElement value, string name, bool allowBlank, int maximumLength, Func<Gw2ConfigurationException> invalid)
+    {
+        var property = MasteryProperty(value, name, invalid);
+        return property.ValueKind == JsonValueKind.String && property.GetString() is { } text && text.Length <= maximumLength && (allowBlank || !string.IsNullOrWhiteSpace(text)) ? text : throw invalid();
     }
 
     private async Task<IReadOnlyList<Gw2AccountAchievementProgressEntry>> DeserializeAccountAchievementProgressAsync(HttpResponseMessage response, CancellationToken cancellationToken)
@@ -3100,6 +3283,9 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidLegendaryArmoryMetadataResponse() => new("GW2 returned invalid Legendary Armory item metadata. Try again later.");
     private static Gw2ConfigurationException InvalidAccountAchievementProgressResponse() => new("GW2 returned an invalid account achievement-progress response. Try again later.");
     private static Gw2ConfigurationException InvalidPublicAchievementResponse() => new("GW2 returned an invalid public achievement-definition response. Try again later.");
+    private static Gw2ConfigurationException InvalidAccountMasteryResponse() => new("GW2 returned an invalid account masteries response. Try again later.");
+    private static Gw2ConfigurationException InvalidMasteryPointsResponse() => new("GW2 returned an invalid mastery-points response. Try again later.");
+    private static Gw2ConfigurationException InvalidPublicMasteryResponse() => new("GW2 returned invalid public mastery metadata. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
@@ -3307,6 +3493,16 @@ public sealed record Gw2AccountAchievementProgressEntry(long Id, long? Current, 
 public sealed record Gw2PublicAchievements(IReadOnlyList<Gw2PublicAchievement> Achievements, IReadOnlyList<long> MissingAchievementIds);
 public sealed record Gw2PublicAchievement(long Id, string Name, string? Description, string? Requirement, string? LockedText, string Type, IReadOnlyList<string> Flags, IReadOnlyList<Gw2AchievementBit>? Bits);
 public sealed record Gw2AchievementBit(string? Type, long? Id, string? Text);
+public sealed record Gw2AccountMasterySources(
+    IReadOnlyList<Gw2AccountMasteryTrack> Tracks,
+    IReadOnlyList<Gw2MasteryPointTotal> PointTotals,
+    DateTimeOffset AccountMasteriesAsOf,
+    DateTimeOffset MasteryPointsAsOf);
+public sealed record Gw2AccountMasteryTrack(long Id, long? SourceLevel);
+public sealed record Gw2MasteryPointTotal(string Region, long Spent, long Earned);
+public sealed record Gw2PublicMasteries(IReadOnlyList<Gw2PublicMastery> Masteries, IReadOnlyList<long> MissingMasteryIds);
+public sealed record Gw2PublicMastery(long Id, string Name, string Requirement, string Region, long Order, IReadOnlyList<Gw2PublicMasteryLevel> Levels);
+public sealed record Gw2PublicMasteryLevel(string Name, string Description, string Instruction, long PointCost, long ExperienceCost);
 public sealed record Gw2CharacterBuild(
     string CharacterName,
     int Tab,

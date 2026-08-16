@@ -18,7 +18,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_fifteen_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_sixteen_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -28,7 +28,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_achievement_progress", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_item_prices", "get_items", "get_legendary_armory", "get_recipes", "get_trading_post_activity", "get_wallet", "value_items"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_achievement_progress", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_item_prices", "get_items", "get_legendary_armory", "get_mastery_progress", "get_recipes", "get_trading_post_activity", "get_wallet", "value_items"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -48,6 +48,14 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         AssertSchemaRequired(achievementRow.GetProperty("properties").GetProperty("completedBits").GetProperty("items"), "index", "isDefinitionResolved", "type", "id", "text");
         Assert.DoesNotContain("key", achievementProgress.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", achievementProgress.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        var masteryProgress = toolsByName["get_mastery_progress"];
+        Assert.Empty(masteryProgress.GetProperty("inputSchema").GetProperty("properties").EnumerateObject());
+        AssertSchemaRequired(masteryProgress.GetProperty("outputSchema"), "tracks", "pointTotals", "metadataStatus", "missingMetadataTrackIds", "areAllMetadataTracksResolved", "warnings", "accountMasteriesAsOf", "masteryPointsAsOf", "metadataAsOf", "asOf", "isAtomicSnapshot", "sourceStatement", "completenessStatement", "scopeStatement");
+        AssertSchemaRequired(masteryProgress.GetProperty("outputSchema").GetProperty("properties").GetProperty("tracks").GetProperty("items"), "id", "sourceLevel", "unlockedLevelCount", "metadataStatus", "name", "requirement", "region", "order", "levelCount", "currentLevel", "nextLevel");
+        var masteryLevelSchema = masteryProgress.GetProperty("outputSchema").GetProperty("properties").GetProperty("tracks").GetProperty("items").GetProperty("properties").GetProperty("currentLevel");
+        AssertSchemaRequired(masteryLevelSchema, "index", "name", "description", "instruction", "pointCost", "experienceCost");
+        AssertSchemaRequired(masteryProgress.GetProperty("outputSchema").GetProperty("properties").GetProperty("pointTotals").GetProperty("items"), "region", "spent", "earned", "available");
+        Assert.DoesNotContain("key", masteryProgress.GetRawText(), StringComparison.OrdinalIgnoreCase);
         var activity = toolsByName["get_trading_post_activity"];
         Assert.Equal(["mode", "page", "pageSize"], activity.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
         AssertSchemaRequired(activity.GetProperty("inputSchema"), "mode");
@@ -226,6 +234,25 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.False(structured.GetProperty("isAtomicSnapshot").GetBoolean());
         Assert.DoesNotContain("GW2_API_KEY", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", payload, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetMasteryProgress_invokes_without_arguments_and_returns_explicit_metadata_nulls()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(31, "tools/call", new { name = "get_mastery_progress", arguments = new { } });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal(["tracks", "pointTotals", "metadataStatus", "missingMetadataTrackIds", "areAllMetadataTracksResolved", "warnings", "accountMasteriesAsOf", "masteryPointsAsOf", "metadataAsOf", "asOf", "isAtomicSnapshot", "sourceStatement", "completenessStatement", "scopeStatement"], structured.EnumerateObject().Select(property => property.Name));
+        Assert.Empty(structured.GetProperty("tracks").EnumerateArray());
+        Assert.Empty(structured.GetProperty("pointTotals").EnumerateArray());
+        Assert.Equal("NotNeeded", structured.GetProperty("metadataStatus").GetString());
+        Assert.Empty(structured.GetProperty("missingMetadataTrackIds").EnumerateArray());
+        Assert.Equal(JsonValueKind.Null, structured.GetProperty("metadataAsOf").ValueKind);
+        Assert.False(structured.GetProperty("isAtomicSnapshot").GetBoolean());
+        Assert.DoesNotContain("GW2_API_KEY", structured.GetRawText(), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1059,6 +1086,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             Task.FromResult(new Gw2AccountAchievementProgress([new Gw2AccountAchievementProgressEntry(1, 1, 1, true, null, true, [])]));
         public Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2PublicAchievements(achievementIds.Where(id => id == 1).Select(id => new Gw2PublicAchievement(id, "Synthetic achievement", "", "", "", "Basic", [], [])).ToArray(), achievementIds.Where(id => id != 1).ToArray()));
+        public Task<Gw2AccountMasterySources> GetAccountMasterySourcesAsync(CancellationToken cancellationToken) => Task.FromResult(new Gw2AccountMasterySources([], [], DateTimeOffset.Parse("2026-08-12T12:00:00Z"), DateTimeOffset.Parse("2026-08-12T12:00:00Z")));
+        public Task<Gw2PublicMasteries> GetPublicMasteriesAsync(IReadOnlyList<long> masteryIds, CancellationToken cancellationToken) => throw new NotSupportedException();
 
     }
 
@@ -1122,6 +1151,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required progression permission. Create a key with the progression permission.");
         public Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2AccountMasterySources> GetAccountMasterySourcesAsync(CancellationToken cancellationToken) => throw new Gw2ConfigurationException("GW2_API_KEY is missing the required progression permission. Create a key with the progression permission.");
+        public Task<Gw2PublicMasteries> GetPublicMasteriesAsync(IReadOnlyList<long> masteryIds, CancellationToken cancellationToken) => throw new NotSupportedException();
 
     }
 
@@ -1170,6 +1201,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2AccountMasterySources> GetAccountMasterySourcesAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2PublicMasteries> GetPublicMasteriesAsync(IReadOnlyList<long> masteryIds, CancellationToken cancellationToken) => throw new NotSupportedException();
 
     }
 
