@@ -18,7 +18,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_fourteen_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_fifteen_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -28,7 +28,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_item_prices", "get_items", "get_legendary_armory", "get_recipes", "get_trading_post_activity", "get_wallet", "value_items"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_achievement_progress", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_item_prices", "get_items", "get_legendary_armory", "get_recipes", "get_trading_post_activity", "get_wallet", "value_items"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -39,6 +39,15 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         }
 
         var toolsByName = discoveredTools.ToDictionary(tool => tool.GetProperty("name").GetString()!);
+        var achievementProgress = toolsByName["get_achievement_progress"];
+        Assert.Equal(["achievementIds"], achievementProgress.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        AssertSchemaRequired(achievementProgress.GetProperty("inputSchema"), "achievementIds");
+        AssertSchemaRequired(achievementProgress.GetProperty("outputSchema"), "rows", "missingDefinitionIds", "areAllDefinitionsResolved", "warnings", "accountProgressAsOf", "definitionsAsOf", "asOf", "isAtomicSnapshot", "sourceStatement", "completenessStatement", "scopeStatement");
+        var achievementRow = achievementProgress.GetProperty("outputSchema").GetProperty("properties").GetProperty("rows").GetProperty("items");
+        AssertSchemaRequired(achievementRow, "id", "accountProgressStatus", "current", "max", "done", "repeated", "isUnlocked", "completedBits", "definitionStatus", "name", "description", "requirement", "lockedText", "type", "flags", "bitCount");
+        AssertSchemaRequired(achievementRow.GetProperty("properties").GetProperty("completedBits").GetProperty("items"), "index", "isDefinitionResolved", "type", "id", "text");
+        Assert.DoesNotContain("key", achievementProgress.GetRawText(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", achievementProgress.GetRawText(), StringComparison.OrdinalIgnoreCase);
         var activity = toolsByName["get_trading_post_activity"];
         Assert.Equal(["mode", "page", "pageSize"], activity.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
         AssertSchemaRequired(activity.GetProperty("inputSchema"), "mode");
@@ -193,6 +202,30 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.DoesNotContain("ownedTotal", characterInventory.GetRawText(), StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("GW2_CHARACTER_INVENTORY", characterInventory.GetRawText(), StringComparison.Ordinal);
         Assert.Contains("must not be added as a second ownership source", characterInventory.GetProperty("description").GetString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetAchievementProgress_returns_compact_requested_rows_with_explicit_nulls()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(30, "tools/call", new { name = "get_achievement_progress", arguments = new { achievementIds = new[] { 999L, 1L } } });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+        using var document = JsonDocument.Parse(payload);
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal(["rows", "missingDefinitionIds", "areAllDefinitionsResolved", "warnings", "accountProgressAsOf", "definitionsAsOf", "asOf", "isAtomicSnapshot", "sourceStatement", "completenessStatement", "scopeStatement"], structured.EnumerateObject().Select(property => property.Name));
+        var rows = structured.GetProperty("rows").EnumerateArray().ToArray();
+        Assert.Equal([999L, 1L], rows.Select(row => row.GetProperty("id").GetInt64()));
+        Assert.Equal("NoAccountProgressRecord", rows[0].GetProperty("accountProgressStatus").GetString());
+        Assert.Equal("NoPublicAchievementResource", rows[0].GetProperty("definitionStatus").GetString());
+        Assert.Equal(JsonValueKind.Null, rows[0].GetProperty("done").ValueKind);
+        Assert.Equal("Found", rows[1].GetProperty("definitionStatus").GetString());
+        Assert.False(structured.GetProperty("areAllDefinitionsResolved").GetBoolean());
+        Assert.Equal([999L], structured.GetProperty("missingDefinitionIds").EnumerateArray().Select(id => id.GetInt64()));
+        Assert.False(structured.GetProperty("isAtomicSnapshot").GetBoolean());
+        Assert.DoesNotContain("GW2_API_KEY", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("token", payload, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1022,6 +1055,11 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2LegendaryArmory([new Gw2LegendaryArmoryEntry(101, 0, null, null, null, null)], false, [new Gw2MetadataWarning("metadata_unresolved", "items", "101")]));
 
+        public Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2AccountAchievementProgress([new Gw2AccountAchievementProgressEntry(1, 1, 1, true, null, true, [])]));
+        public Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2PublicAchievements(achievementIds.Where(id => id == 1).Select(id => new Gw2PublicAchievement(id, "Synthetic achievement", "", "", "", "Basic", [], [])).ToArray(), achievementIds.Where(id => id != 1).ToArray()));
+
     }
 
     private sealed class ErrorGw2ApiClient : IGw2ApiClient
@@ -1081,6 +1119,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2_API_KEY is missing the required unlocks permission. Create a key with the unlocks permission.");
+        public Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("GW2_API_KEY is missing the required progression permission. Create a key with the progression permission.");
+        public Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken) => throw new NotSupportedException();
 
     }
 
@@ -1127,6 +1168,8 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2AccountRecipeUnlocks> GetAccountRecipeUnlocksAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken) => throw new NotSupportedException();
 
     }
 

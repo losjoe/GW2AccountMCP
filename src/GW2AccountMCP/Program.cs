@@ -44,6 +44,7 @@ builder.Services
     .WithTools<GetAccountTool>()
     .WithTools<GetAccountHoldingsTool>()
     .WithTools<GetTradingPostActivityTool>()
+    .WithTools<GetAchievementProgressTool>()
     .WithTools<GetLegendaryArmoryTool>()
     .WithTools<GetCharacterBuildTool>()
     .WithTools<GetCharacterEquipmentTool>()

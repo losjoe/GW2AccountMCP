@@ -29,6 +29,8 @@ public interface IGw2ApiClient
     Task<Gw2RecipeSelector> SearchPublicRecipesByOutputItemAsync(long itemId, CancellationToken cancellationToken);
     Task<Gw2AccountRecipeUnlocks> GetAccountRecipeUnlocksAsync(CancellationToken cancellationToken);
     Task<Gw2LegendaryArmory> GetLegendaryArmoryAsync(CancellationToken cancellationToken);
+    Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken);
+    Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken);
 }
 
 public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, TimeProvider? timeProvider = null) : IGw2ApiClient
@@ -51,6 +53,9 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const int MaximumAccountRecipePayloadBytes = 256 * 1024;
     private const int MaximumAccountRecipeIds = 25_000;
     private const int MaximumLegendaryArmoryRows = 256;
+    private const int MaximumAccountAchievementPayloadBytes = 4 * 1024 * 1024;
+    private const int MaximumAccountAchievementRows = 20_000;
+    private const int MaximumPublicAchievementPayloadBytes = 1024 * 1024;
     private const int MaximumEquipmentRows = 32;
     private const int MaximumEquipmentReferences = 200;
     private const int MaximumEquipmentStatAttributes = 32;
@@ -834,6 +839,177 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
                 : new Gw2LegendaryArmoryEntry(entry.Id, entry.Count, null, null, null, null)).ToArray(),
             warnings.Length == 0,
             warnings);
+    }
+
+    public async Task<Gw2AccountAchievementProgress> GetAccountAchievementProgressAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey)) throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        try
+        {
+            await ValidatePermissionsAsync(["account", "progression"], cancellationToken);
+            using var request = await SendAchievementWithSingleRetryAsync("/v2/account/achievements", cancellationToken, authenticated: true);
+            if (request.Response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
+            if (request.Response.StatusCode != HttpStatusCode.OK) throw new Gw2ConfigurationException($"GW2 account achievement-progress request failed with HTTP {(int)request.Response.StatusCode}. Try again later.");
+            return new Gw2AccountAchievementProgress(await DeserializeAccountAchievementProgressAsync(request.Response, request.CancellationToken));
+        }
+        catch (IOException) { throw InvalidAccountAchievementProgressResponse(); }
+        catch (JsonException) { throw InvalidAccountAchievementProgressResponse(); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new Gw2ConfigurationException("GW2 account achievement-progress request timed out. Try again later."); }
+    }
+
+    public async Task<Gw2PublicAchievements> GetPublicAchievementsAsync(IReadOnlyList<long> achievementIds, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(achievementIds);
+        if (achievementIds.Count is 0 or > 20 || achievementIds.Any(id => id <= 0) || achievementIds.Distinct().Count() != achievementIds.Count)
+        {
+            throw new ArgumentException("Achievement IDs must contain 1 to 20 unique positive values.", nameof(achievementIds));
+        }
+
+        try
+        {
+            using var request = await SendAchievementWithSingleRetryAsync($"/v2/achievements?ids={Uri.EscapeDataString(string.Join(',', achievementIds))}", cancellationToken, authenticated: false);
+            if (request.Response.StatusCode == HttpStatusCode.NotFound)
+            {
+                await ReadAchievementBodyAsync(request.Response.Content, MaximumPublicAchievementPayloadBytes, InvalidPublicAchievementResponse, request.CancellationToken);
+                return new Gw2PublicAchievements([], achievementIds.ToArray());
+            }
+            if (request.Response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent)
+            {
+                throw new Gw2ConfigurationException($"GW2 public achievement-definition request failed with HTTP {(int)request.Response.StatusCode}. Try again later.");
+            }
+
+            var rows = await DeserializePublicAchievementsAsync(request.Response, achievementIds.ToHashSet(), request.CancellationToken);
+            var byId = rows.ToDictionary(row => row.Id);
+            var missing = achievementIds.Where(id => !byId.ContainsKey(id)).ToArray();
+            if ((request.Response.StatusCode == HttpStatusCode.OK && missing.Length != 0)
+                || (request.Response.StatusCode == HttpStatusCode.PartialContent && (rows.Count == 0 || missing.Length == 0)))
+            {
+                throw InvalidPublicAchievementResponse();
+            }
+
+            return new Gw2PublicAchievements(achievementIds.Where(byId.ContainsKey).Select(id => byId[id]).ToArray(), missing);
+        }
+        catch (IOException) { throw InvalidPublicAchievementResponse(); }
+        catch (JsonException) { throw InvalidPublicAchievementResponse(); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new Gw2ConfigurationException("GW2 public achievement-definition request timed out. Try again later."); }
+    }
+
+    private async Task<IReadOnlyList<Gw2AccountAchievementProgressEntry>> DeserializeAccountAchievementProgressAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        using var document = JsonDocument.Parse(await ReadAchievementBodyAsync(response.Content, MaximumAccountAchievementPayloadBytes, InvalidAccountAchievementProgressResponse, cancellationToken));
+        if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() > MaximumAccountAchievementRows) throw InvalidAccountAchievementProgressResponse();
+        var ids = new HashSet<long>();
+        var rows = new List<Gw2AccountAchievementProgressEntry>();
+        foreach (var value in document.RootElement.EnumerateArray())
+        {
+            var row = AchievementObject(value, InvalidAccountAchievementProgressResponse);
+            var id = AchievementPositiveLong(row, "id", InvalidAccountAchievementProgressResponse);
+            if (!ids.Add(id)) throw InvalidAccountAchievementProgressResponse();
+            var done = AchievementBoolean(row, "done", InvalidAccountAchievementProgressResponse);
+            var current = AchievementOptionalNonnegativeLong(row, "current", InvalidAccountAchievementProgressResponse);
+            var max = AchievementOptionalNonnegativeLong(row, "max", InvalidAccountAchievementProgressResponse);
+            var repeated = AchievementOptionalNonnegativeLong(row, "repeated", InvalidAccountAchievementProgressResponse);
+            var unlocked = AchievementOptionalBoolean(row, "unlocked", true, InvalidAccountAchievementProgressResponse);
+            IReadOnlyList<long>? bits = null;
+            if (TryAchievementProperty(row, "bits", InvalidAccountAchievementProgressResponse, out var bitsValue))
+            {
+                if (bitsValue.ValueKind != JsonValueKind.Array) throw InvalidAccountAchievementProgressResponse();
+                bits = bitsValue.EnumerateArray().Select(bit => bit.ValueKind == JsonValueKind.Number && bit.TryGetInt64(out var index) && index >= 0 ? index : throw InvalidAccountAchievementProgressResponse()).ToArray();
+            }
+            rows.Add(new Gw2AccountAchievementProgressEntry(id, current, max, done, repeated, unlocked, bits));
+        }
+        return rows;
+    }
+
+    private async Task<IReadOnlyList<Gw2PublicAchievement>> DeserializePublicAchievementsAsync(HttpResponseMessage response, IReadOnlySet<long> requestedIds, CancellationToken cancellationToken)
+    {
+        using var document = JsonDocument.Parse(await ReadAchievementBodyAsync(response.Content, MaximumPublicAchievementPayloadBytes, InvalidPublicAchievementResponse, cancellationToken));
+        if (document.RootElement.ValueKind != JsonValueKind.Array) throw InvalidPublicAchievementResponse();
+        var rows = new List<Gw2PublicAchievement>();
+        var ids = new HashSet<long>();
+        foreach (var value in document.RootElement.EnumerateArray())
+        {
+            var row = AchievementObject(value, InvalidPublicAchievementResponse);
+            var id = AchievementPositiveLong(row, "id", InvalidPublicAchievementResponse);
+            if (!requestedIds.Contains(id) || !ids.Add(id)) throw InvalidPublicAchievementResponse();
+            var name = AchievementRequiredString(row, "name", false, InvalidPublicAchievementResponse);
+            var type = AchievementRequiredString(row, "type", false, InvalidPublicAchievementResponse);
+            var description = AchievementOptionalString(row, "description", true, InvalidPublicAchievementResponse);
+            var requirement = AchievementOptionalString(row, "requirement", true, InvalidPublicAchievementResponse);
+            var lockedText = AchievementOptionalString(row, "locked_text", true, InvalidPublicAchievementResponse);
+            var flags = AchievementOptionalStringArray(row, "flags", InvalidPublicAchievementResponse);
+            IReadOnlyList<Gw2AchievementBit>? bits = null;
+            if (TryAchievementProperty(row, "bits", InvalidPublicAchievementResponse, out var bitsValue))
+            {
+                if (bitsValue.ValueKind != JsonValueKind.Array) throw InvalidPublicAchievementResponse();
+                bits = bitsValue.EnumerateArray().Select(bit => ParseAchievementBit(bit)).ToArray();
+            }
+            rows.Add(new Gw2PublicAchievement(id, name, description, requirement, lockedText, type, flags, bits));
+        }
+        return rows;
+    }
+
+    private static Gw2AchievementBit ParseAchievementBit(JsonElement value)
+    {
+        var bit = AchievementObject(value, InvalidPublicAchievementResponse);
+        var type = AchievementOptionalString(bit, "type", true, InvalidPublicAchievementResponse);
+        var id = AchievementOptionalNonnegativeLong(bit, "id", InvalidPublicAchievementResponse);
+        var text = AchievementOptionalString(bit, "text", true, InvalidPublicAchievementResponse);
+        return new Gw2AchievementBit(type, id, text);
+    }
+
+    private static async Task<byte[]> ReadAchievementBodyAsync(HttpContent content, int maximumBytes, Func<Gw2ConfigurationException> invalid, CancellationToken cancellationToken)
+    {
+        if (content.Headers.ContentLength is { } contentLength && contentLength > maximumBytes) throw invalid();
+        await using var stream = await content.ReadAsStreamAsync(cancellationToken);
+        await using var buffer = new MemoryStream();
+        var chunk = new byte[81920];
+        var total = 0;
+        for (var read = await stream.ReadAsync(chunk, cancellationToken); read != 0; read = await stream.ReadAsync(chunk, cancellationToken))
+        {
+            total = checked(total + read);
+            if (total > maximumBytes) throw invalid();
+            await buffer.WriteAsync(chunk.AsMemory(0, read), cancellationToken);
+        }
+        return buffer.ToArray();
+    }
+
+    private static JsonElement AchievementObject(JsonElement value, Func<Gw2ConfigurationException> invalid) => value.ValueKind == JsonValueKind.Object ? value : throw invalid();
+    private static bool TryAchievementProperty(JsonElement value, string name, Func<Gw2ConfigurationException> invalid, out JsonElement property)
+    {
+        var matches = value.EnumerateObject().Where(candidate => candidate.NameEquals(name)).ToArray();
+        if (matches.Length > 1) throw invalid();
+        property = matches.Length == 1 ? matches[0].Value : default;
+        return matches.Length == 1;
+    }
+    private static JsonElement AchievementProperty(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => TryAchievementProperty(value, name, invalid, out var property) ? property : throw invalid();
+    private static long AchievementPositiveLong(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => AchievementProperty(value, name, invalid).ValueKind == JsonValueKind.Number && AchievementProperty(value, name, invalid).TryGetInt64(out var number) && number > 0 ? number : throw invalid();
+    private static long? AchievementOptionalNonnegativeLong(JsonElement value, string name, Func<Gw2ConfigurationException> invalid)
+    {
+        if (!TryAchievementProperty(value, name, invalid, out var property) || property.ValueKind == JsonValueKind.Null) return null;
+        return property.ValueKind == JsonValueKind.Number && property.TryGetInt64(out var number) && number >= 0 ? number : throw invalid();
+    }
+    private static bool AchievementBoolean(JsonElement value, string name, Func<Gw2ConfigurationException> invalid) => AchievementProperty(value, name, invalid).ValueKind is JsonValueKind.True ? true : AchievementProperty(value, name, invalid).ValueKind is JsonValueKind.False ? false : throw invalid();
+    private static bool AchievementOptionalBoolean(JsonElement value, string name, bool absentValue, Func<Gw2ConfigurationException> invalid)
+    {
+        if (!TryAchievementProperty(value, name, invalid, out var property)) return absentValue;
+        return property.ValueKind is JsonValueKind.True ? true : property.ValueKind is JsonValueKind.False ? false : throw invalid();
+    }
+    private static string AchievementRequiredString(JsonElement value, string name, bool allowBlank, Func<Gw2ConfigurationException> invalid)
+    {
+        var property = AchievementProperty(value, name, invalid);
+        return property.ValueKind == JsonValueKind.String && (allowBlank || !string.IsNullOrWhiteSpace(property.GetString())) ? property.GetString()! : throw invalid();
+    }
+    private static string? AchievementOptionalString(JsonElement value, string name, bool allowBlank, Func<Gw2ConfigurationException> invalid)
+    {
+        if (!TryAchievementProperty(value, name, invalid, out var property) || property.ValueKind == JsonValueKind.Null) return null;
+        return property.ValueKind == JsonValueKind.String && (allowBlank || !string.IsNullOrWhiteSpace(property.GetString())) ? property.GetString() : throw invalid();
+    }
+    private static IReadOnlyList<string> AchievementOptionalStringArray(JsonElement value, string name, Func<Gw2ConfigurationException> invalid)
+    {
+        if (!TryAchievementProperty(value, name, invalid, out var property)) return [];
+        if (property.ValueKind != JsonValueKind.Array) throw invalid();
+        return property.EnumerateArray().Select(entry => entry.ValueKind == JsonValueKind.String ? entry.GetString()! : throw invalid()).ToArray();
     }
 
     private async Task<IReadOnlyList<LegendaryArmoryOwnership>> DeserializeLegendaryArmoryAsync(HttpResponseMessage response, CancellationToken cancellationToken)
@@ -2656,6 +2832,39 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return Encoding.UTF8.GetString(body).Contains("invalid key", StringComparison.OrdinalIgnoreCase);
     }
 
+    private async Task<TimedHttpResponse> SendAchievementWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var timeoutSource = new CancellationTokenSource(RecipeAttemptTimeout, timeProvider ?? TimeProvider.System);
+            var linkedSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutSource.Token);
+            HttpResponseMessage response;
+            try { response = await SendAsync(path, linkedSource.Token, authenticated); }
+            catch { linkedSource.Dispose(); timeoutSource.Dispose(); throw; }
+
+            bool retry;
+            try
+            {
+                var transient = response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout;
+                var invalidKey = authenticated && response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                    && await IsInvalidKeyResponseAsync(response, linkedSource.Token);
+                retry = transient || invalidKey;
+            }
+            catch { response.Dispose(); linkedSource.Dispose(); timeoutSource.Dispose(); throw; }
+
+            if (attempt == 0 && retry)
+            {
+                var delay = response.StatusCode is HttpStatusCode.TooManyRequests or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable or HttpStatusCode.GatewayTimeout ? GetRetryDelay(response) : TimeSpan.Zero;
+                response.Dispose();
+                linkedSource.Dispose();
+                timeoutSource.Dispose();
+                await Task.Delay(delay, timeProvider ?? TimeProvider.System, cancellationToken);
+                continue;
+            }
+            return new TimedHttpResponse(response, timeoutSource, linkedSource);
+        }
+    }
+
     private async Task<TimedHttpResponse> SendRecipeWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated)
     {
         for (var attempt = 0; ; attempt++)
@@ -2889,6 +3098,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidAccountRecipeUnlockResponse() => new("GW2 returned an invalid account recipe-unlock response. Try again later.");
     private static Gw2ConfigurationException InvalidLegendaryArmoryResponse() => new("GW2 returned an invalid Legendary Armory response. Try again later.");
     private static Gw2ConfigurationException InvalidLegendaryArmoryMetadataResponse() => new("GW2 returned invalid Legendary Armory item metadata. Try again later.");
+    private static Gw2ConfigurationException InvalidAccountAchievementProgressResponse() => new("GW2 returned an invalid account achievement-progress response. Try again later.");
+    private static Gw2ConfigurationException InvalidPublicAchievementResponse() => new("GW2 returned an invalid public achievement-definition response. Try again later.");
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
@@ -3091,6 +3302,11 @@ public sealed record Gw2RecipeSelector(IReadOnlyList<long> RecipeIds);
 public sealed record Gw2AccountRecipeUnlocks(IReadOnlyList<long> RecipeIds);
 public sealed record Gw2LegendaryArmory(IReadOnlyList<Gw2LegendaryArmoryEntry> Entries, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
 public sealed record Gw2LegendaryArmoryEntry(long Id, long ArmoryCount, string? Name, string? Type, string? Subtype, string? WeightClass);
+public sealed record Gw2AccountAchievementProgress(IReadOnlyList<Gw2AccountAchievementProgressEntry> Entries);
+public sealed record Gw2AccountAchievementProgressEntry(long Id, long? Current, long? Max, bool Done, long? Repeated, bool IsUnlocked, IReadOnlyList<long>? CompletedBits);
+public sealed record Gw2PublicAchievements(IReadOnlyList<Gw2PublicAchievement> Achievements, IReadOnlyList<long> MissingAchievementIds);
+public sealed record Gw2PublicAchievement(long Id, string Name, string? Description, string? Requirement, string? LockedText, string Type, IReadOnlyList<string> Flags, IReadOnlyList<Gw2AchievementBit>? Bits);
+public sealed record Gw2AchievementBit(string? Type, long? Id, string? Text);
 public sealed record Gw2CharacterBuild(
     string CharacterName,
     int Tab,

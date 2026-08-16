@@ -3887,6 +3887,140 @@ public sealed class Gw2ApiClientTests
         ["X-Result-Total"] = resultTotal
     };
 
+    [Fact]
+    public async Task Achievement_progress_sources_enforce_routes_authentication_status_and_shape_contracts()
+    {
+        var apiKey = new string('k', 16);
+        var accountHandler = new RecordingHandler(
+            """{"permissions":["account","progression"]}""",
+            """[{"id":2,"done":true,"current":4,"max":6,"repeated":1,"bits":[1,1,4]},{"id":1,"done":false}]""");
+        using var accountHttpClient = new HttpClient(accountHandler) { BaseAddress = new Uri("https://example.test") };
+        var account = await new Gw2ApiClient(accountHttpClient, new Gw2ApiOptions(apiKey, "https://example.test")).GetAccountAchievementProgressAsync(CancellationToken.None);
+
+        Assert.Equal([2L, 1L], account.Entries.Select(entry => entry.Id));
+        Assert.Equal([1L, 1L, 4L], account.Entries[0].CompletedBits);
+        Assert.True(account.Entries[1].IsUnlocked);
+        Assert.Null(account.Entries[1].CompletedBits);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/account/achievements?lang=en&v=2025-08-29T01%3A00%3A00.000Z"], accountHandler.RequestUris);
+        Assert.All(accountHandler.AuthorizationHeaders, header => Assert.Equal("Bearer " + apiKey, header));
+
+        var publicHandler = new RecordingHandler(new ResponseSpec("""[{"id":2,"name":"Two","description":"","requirement":"","locked_text":"","type":"Future","flags":["Z","A"],"bits":[{}, {"type":"FutureBit","id":0,"text":""}]}]""", HttpStatusCode.PartialContent));
+        using var publicHttpClient = new HttpClient(publicHandler) { BaseAddress = new Uri("https://example.test") };
+        var definitions = await new Gw2ApiClient(publicHttpClient, new Gw2ApiOptions(apiKey, "https://example.test")).GetPublicAchievementsAsync([2, 1], CancellationToken.None);
+
+        Assert.Equal([2L], definitions.Achievements.Select(definition => definition.Id));
+        Assert.Equal([1L], definitions.MissingAchievementIds);
+        Assert.Equal("/v2/achievements?ids=2%2C1&lang=en&v=2025-08-29T01%3A00%3A00.000Z", Assert.Single(publicHandler.RequestUris));
+        Assert.Null(Assert.Single(publicHandler.AuthorizationHeaders));
+        Assert.Equal((string?)null, definitions.Achievements[0].Bits![0].Type);
+        Assert.Equal(0L, definitions.Achievements[0].Bits![1].Id);
+    }
+
+    [Theory]
+    [InlineData("[{\"id\":1,\"done\":true},{\"id\":1,\"done\":false}]")]
+    [InlineData("[{\"id\":1,\"done\":\"true\"}]")]
+    [InlineData("[{\"id\":1,\"done\":true,\"bits\":[-1]}]")]
+    public async Task Account_achievement_progress_rejects_invalid_complete_source_without_exposing_body(string body)
+    {
+        var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", body);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test")).GetAccountAchievementProgressAsync(CancellationToken.None));
+
+        Assert.Contains("achievement-progress", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(body, error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Public_achievement_definitions_accept_all_missing_404_retry_once_and_reject_invalid_partial_shapes()
+    {
+        var missingHandler = new RecordingHandler(new ResponseSpec("private", HttpStatusCode.NotFound));
+        using var missingHttpClient = new HttpClient(missingHandler) { BaseAddress = new Uri("https://example.test") };
+        var missing = await new Gw2ApiClient(missingHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicAchievementsAsync([2, 1], CancellationToken.None);
+        Assert.Empty(missing.Achievements);
+        Assert.Equal([2L, 1L], missing.MissingAchievementIds);
+
+        var retryHandler = new RecordingHandler(new ResponseSpec("", HttpStatusCode.ServiceUnavailable), """[{"id":1,"name":"One","type":"Basic"}]""");
+        using var retryHttpClient = new HttpClient(retryHandler) { BaseAddress = new Uri("https://example.test") };
+        Assert.Single((await new Gw2ApiClient(retryHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicAchievementsAsync([1], CancellationToken.None)).Achievements);
+        Assert.Equal(2, retryHandler.RequestUris.Count);
+
+        var invalidHandler = new RecordingHandler(new ResponseSpec("""[{"id":1,"name":"One","type":"Basic"}]""", HttpStatusCode.PartialContent));
+        using var invalidHttpClient = new HttpClient(invalidHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(invalidHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicAchievementsAsync([1], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Public_achievement_definition_404_enforces_the_body_bound()
+    {
+        var response = new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new ByteArrayContent("private"u8.ToArray()) };
+        response.Content.Headers.ContentLength = (1024 * 1024) + 1;
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicAchievementsAsync([1], CancellationToken.None));
+
+        Assert.Contains("achievement-definition", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("secret", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Public_achievement_definition_404_timeout_covers_the_post_header_body()
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var response = new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StallingHttpContent(timeProvider) };
+        var handler = new RecordingHandler(response);
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test"), timeProvider).GetPublicAchievementsAsync([1], CancellationToken.None));
+
+        Assert.Contains("timed out", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.True(timeProvider.Fired);
+
+        using var cancellationSource = new CancellationTokenSource();
+        var cancellationHandler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("private") }) { OnRequest = cancellationSource.Cancel };
+        using var cancellationHttpClient = new HttpClient(cancellationHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(cancellationHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicAchievementsAsync([1], cancellationSource.Token));
+    }
+
+    [Fact]
+    public async Task Achievement_progress_enforces_account_and_public_body_and_row_bounds_without_private_details()
+    {
+        var accountOversize = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent("[]"u8.ToArray()) };
+        accountOversize.Content.Headers.ContentLength = (4 * 1024 * 1024) + 1;
+        var accountHandler = new RecordingHandler("""{"permissions":["account","progression"]}""", accountOversize);
+        using var accountHttpClient = new HttpClient(accountHandler) { BaseAddress = new Uri("https://example.test") };
+        var accountError = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(accountHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetAccountAchievementProgressAsync(CancellationToken.None));
+        Assert.DoesNotContain("secret", accountError.Message, StringComparison.Ordinal);
+
+        var tooManyRows = "[" + string.Join(',', Enumerable.Range(1, 20_001).Select(id => "{\"id\":" + id + ",\"done\":false}")) + "]";
+        var rowHandler = new RecordingHandler("""{"permissions":["account","progression"]}""", tooManyRows);
+        using var rowHttpClient = new HttpClient(rowHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(rowHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetAccountAchievementProgressAsync(CancellationToken.None));
+
+        var publicOversize = new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent("[]"u8.ToArray()) };
+        publicOversize.Content.Headers.ContentLength = (1024 * 1024) + 1;
+        var publicHandler = new RecordingHandler(publicOversize);
+        using var publicHttpClient = new HttpClient(publicHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(publicHttpClient, new Gw2ApiOptions("secret", "https://example.test")).GetPublicAchievementsAsync([1], CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Achievement_progress_owned_timeout_covers_body_parsing_and_caller_cancellation_propagates()
+    {
+        var timeProvider = new DeferredTimerTimeProvider();
+        var accountHandler = new RecordingHandler("""{"permissions":["account","progression"]}""", new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(timeProvider) });
+        using var accountHttpClient = new HttpClient(accountHandler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(accountHttpClient, new Gw2ApiOptions("secret", "https://example.test"), timeProvider).GetAccountAchievementProgressAsync(CancellationToken.None));
+        Assert.True(timeProvider.Fired);
+
+        using var cancellationSource = new CancellationTokenSource();
+        var handler = new RecordingHandler("""{"permissions":["account","progression"]}""", "[]") { OnRequest = () => cancellationSource.Cancel() };
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => new Gw2ApiClient(httpClient, new Gw2ApiOptions("secret", "https://example.test")).GetAccountAchievementProgressAsync(cancellationSource.Token));
+    }
+
     private static Dictionary<string, string> CurrentSellHeaders(string pageSize, string pageTotal, string resultCount, string resultTotal) => new(StringComparer.OrdinalIgnoreCase)
     {
         ["X-Page-Size"] = pageSize,
