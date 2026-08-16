@@ -1,5 +1,6 @@
 using GW2AccountMCP.Gw2;
 using GW2AccountMCP.Items;
+using GW2AccountMCP.Prices;
 using GW2AccountMCP.Tools;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -17,6 +18,7 @@ var itemCacheOptions = new ItemCacheOptions(
 builder.Services.AddSingleton(gw2Options);
 builder.Services.AddSingleton(gw2ApiBudgetLeaseOptions);
 builder.Services.AddSingleton(itemCacheOptions);
+builder.Services.AddSingleton(new PriceCacheOptions(builder.Configuration["GW2_PUBLIC_CACHE_PATH"] ?? "data/public-cache"));
 builder.Services.AddSingleton<TimeProvider>(TimeProvider.System);
 builder.Services.AddSingleton<Gw2ApiStartGate>();
 builder.Services.AddTransient<Gw2ApiBudgetHandler>();
@@ -28,10 +30,15 @@ builder.Services.AddHttpClient<IGw2ApiClient, Gw2ApiClient>(client =>
     .AddHttpMessageHandler<Gw2ApiBudgetHandler>();
 builder.Services.AddSingleton<IItemCacheReader, ItemCacheReader>();
 builder.Services.AddSingleton<IItemSearchIndex, ItemSearchIndex>();
+builder.Services.AddSingleton<IPriceCacheReader, PriceCacheReader>();
+builder.Services.AddSingleton<IPriceSnapshotProvider, PriceSnapshotProvider>();
+builder.Services.AddSingleton<IItemNameLookup, ItemNameLookup>();
 builder.Services
     .AddMcpServer()
     .WithHttpTransport(options => options.Stateless = true)
     .WithTools<FindItemsTool>()
+    .WithTools<GetItemPricesTool>()
+    .WithTools<ValueItemsTool>()
     .WithTools<GetAccountTool>()
     .WithTools<GetAccountHoldingsTool>()
     .WithTools<GetLegendaryArmoryTool>()

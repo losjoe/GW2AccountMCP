@@ -4,9 +4,11 @@ Local, read-only Guild Wars 2 account facts over stateless Streamable HTTP MCP.
 
 ## Current scope
 
-The server exposes nine tools:
+The server exposes eleven tools:
 
 - `find_items` resolves a bounded English item-name fragment from the generated local public cache. It returns exact matches before contains matches with canonical ID, name, type, rarity, level, and match kind. It does not call the GW2 API at request time or choose among ambiguous names.
+- `get_item_prices` accepts 1-100 distinct positive canonical item IDs and returns caller-ordered factual Trading Post price summaries from the immutable local `prices.manifest.json` generation. It reports nullable English names from the independently published item cache, quote-side aggregate quantities and best unit prices in copper, explicit zero-side and absent-resource semantics, source/cache timestamps, and manual-cache freshness disclosure. It makes no runtime network request, does not return depth or executable volume, and does not recommend an action. Prices may have changed; run `tp --fresh` to collect a newer source snapshot.
+- `value_items` accepts 1-100 caller-ordered distinct positive canonical item IDs with quantities from 1 through `Int32.MaxValue`. From exactly one local price snapshot, it returns nullable best-price factual arithmetic for each row: highest-buy immediate-sale gross, independent 5% listing and 10% exchange fees, and net; lowest-sell buyer cost; and lowest-sell hypothetical-listing gross, fees, and net. Each positive-gross fee is independently rounded half up on that row's aggregate gross and is at least one copper. The three aggregate views return numeric totals only when every requested row has its required quote; otherwise they are explicitly incomplete with null totals and caller-order missing IDs. Best-price values are quote extrapolations without best-level volume, depth, liquidity, or execution guarantees. It does not calculate recipe costs and makes no buy, sell, craft, keep, profit, flip, trend, forecast, velocity, history, or other recommendation.
 - `get_account` validates the configured key through `/v2/tokeninfo`, requires `account`, and returns basic account facts with an `asOf` timestamp.
 - `get_character_build` accepts one exact character name from `get_characters`, requires `account`, `characters`, and `builds`, verifies that name against the complete roster, and returns only that character's active build tab. It preserves fixed specialization, trait, terrestrial/aquatic skill, Ranger pet, and Revenant legend slots; resolves referenced public metadata to compact names where available; and retains unresolved IDs with deterministic warnings and `isMetadataComplete: false`. It does not return inventory, equipment, inactive tabs, or ownership quantities.
 - `get_character_equipment` accepts one exact character name from `get_characters`, requires `account`, `characters`, `builds`, and `inventories`, and returns that character's active PvE/WvW combat-equipment references. It uses the active equipment tab plus a conditional current-equipment lookup for the API's missing Relic, resolves compact item, prefix, upgrade, infusion, and skin metadata, preserves unresolved canonical IDs with warnings, and explicitly marks the result as non-ownership data. It includes terrestrial and aquatic combat slots but excludes PvP, dyes, gathering, fishing, Jade Bot equipment, inventory, inactive tabs, quantities, and Legendary Armory ownership.
@@ -87,7 +89,29 @@ Remove-Item Env:GW2_PUBLIC_CACHE_PATH
 
 Production and test cache directories, retained staging, lock files, and the local workbook are ignored by Git.
 
-The index loads lazily on the first `find_items` call. It checks for a changed cache only after a no-match, then reloads once and reruns that search. Restart MCP when immediate adoption of a newly published cache is required.
+The index loads lazily on the first `find_items` call. It checks for a changed cache only after a no-match, then reloads once and reruns that search. `find_items`, `get_item_prices`, and `value_items` use only local published caches at runtime; none makes a public catalog or Trading Post network request.
+
+### Refresh the public price cache
+
+Publish or resume the independent production price cache from the repository root:
+
+```powershell
+dotnet run --project tools/GW2AccountMCP.DataRefresh -- tp --output data/public-cache
+```
+
+The command publishes an immutable `prices.<sha256>.csv` and manifest-last `prices.manifest.json`. A normal rerun resumes retained `.prices-staging` work or repairs a completed publication without re-fetching it. Use `--fresh` only to discard recognized price staging and collect a newer source snapshot; it never deletes the published generation:
+
+```powershell
+dotnet run --project tools/GW2AccountMCP.DataRefresh -- tp --output data/public-cache --fresh
+```
+
+For an isolated structural test cache only, use an output directory ending in `-test`:
+
+```powershell
+dotnet run --project tools/GW2AccountMCP.DataRefresh -- tp-test --output data/public-cache-test
+```
+
+`tp-test` deliberately publishes only the first bounded page and is not a production price cache.
 
 ### Excel `GetItemNames` query
 
@@ -159,10 +183,12 @@ With the server running, use the current official Inspector CLI flow to list too
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/list
 ```
 
-Then invoke a tool through Inspector. Account-backed tools need a locally configured valid GW2 key with the required scopes; do not paste it into Inspector arguments or chat. `find_items` uses only the local public cache. Holdings still accepts canonical IDs, so resolve names first when needed.
+Then invoke a tool through Inspector. Account-backed tools need a locally configured valid GW2 key with the required scopes; do not paste it into Inspector arguments or chat. `find_items`, `get_item_prices`, and `value_items` use only local public caches. Holdings still accepts canonical IDs, so resolve names first when needed.
 
 ```powershell
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name find_items --tool-args-json '{"query":"Mystic Coin"}' --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_item_prices --tool-args-json '{"itemIds":[19976]}' --format json
+npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name value_items --tool-args-json '{"items":[{"itemId":19976,"quantity":3}]}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_account --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_build --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
 npx @modelcontextprotocol/inspector --cli http://127.0.0.1:5288/mcp --transport http --method tools/call --tool-name get_character_equipment --tool-args-json '{"characterName":"<exact name returned by get_characters>"}' --format json
@@ -183,4 +209,4 @@ Create and associate the tunnel in the OpenAI Platform/ChatGPT UI. Do not create
 tunnel-client init --sample sample_mcp_remote_no_auth --profile gw2-account --tunnel-id <tunnel-id> --mcp-server-url http://127.0.0.1:5288/mcp
 ```
 
-Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly `find_items`, `get_account`, `get_account_holdings`, `get_character_build`, `get_character_equipment`, `get_character_inventory`, `get_characters`, `get_legendary_armory`, and `get_wallet` are discovered, and invoke the desired tool. Keep the launcher running while using the app.
+Configure the profile's reusable runtime key using the persistent-key guide, then run `.\start.ps1`. In ChatGPT web Developer Mode, create a read-only draft app using the tunnel connection, verify that exactly eleven tools are discovered: `find_items`, `get_item_prices`, `value_items`, `get_account`, `get_account_holdings`, `get_character_build`, `get_character_equipment`, `get_character_inventory`, `get_characters`, `get_legendary_armory`, and `get_wallet`. Keep the launcher running while using the app.

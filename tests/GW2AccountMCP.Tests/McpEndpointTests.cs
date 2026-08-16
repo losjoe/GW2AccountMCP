@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using GW2AccountMCP.Gw2;
 using GW2AccountMCP.Items;
+using GW2AccountMCP.Prices;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -17,7 +18,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     public McpEndpointTests(McpApplicationFactory factory) => client = factory.CreateClient();
 
     [Fact]
-    public async Task Mcp_route_discovers_exactly_nine_read_only_structured_tools()
+    public async Task Mcp_route_discovers_exactly_eleven_read_only_structured_tools()
     {
         await InitializeAsync();
 
@@ -27,7 +28,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
 
         var tools = document.RootElement.GetProperty("result").GetProperty("tools");
         var discoveredTools = tools.EnumerateArray().OrderBy(tool => tool.GetProperty("name").GetString()).ToArray();
-        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_legendary_armory", "get_wallet"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
+        Assert.Equal(["find_items", "get_account", "get_account_holdings", "get_character_build", "get_character_equipment", "get_character_inventory", "get_characters", "get_item_prices", "get_legendary_armory", "get_wallet", "value_items"], discoveredTools.Select(tool => tool.GetProperty("name").GetString()));
         foreach (var tool in discoveredTools)
         {
             var annotations = tool.GetProperty("annotations");
@@ -38,6 +39,18 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         }
 
         var toolsByName = discoveredTools.ToDictionary(tool => tool.GetProperty("name").GetString()!);
+        var prices = toolsByName["get_item_prices"];
+        AssertSchemaRequired(prices.GetProperty("inputSchema"), "itemIds");
+        AssertSchemaRequired(prices.GetProperty("outputSchema"), "items", "sourceStartedAtUtc", "sourceCompletedAtUtc", "cacheGeneratedAtUtc", "asOf", "collectionDuration", "cacheAge", "freshnessStatus", "freshnessStatement", "isCompletePriceGeneration", "warnings");
+        var values = toolsByName["value_items"];
+        AssertSchemaRequired(values.GetProperty("inputSchema"), "items");
+        AssertSchemaRequired(values.GetProperty("outputSchema"), "items", "immediateSale", "acquisition", "hypotheticalListing", "feePolicy", "sourceStartedAtUtc", "sourceCompletedAtUtc", "cacheGeneratedAtUtc", "asOf", "collectionDuration", "cacheAge", "freshnessStatus", "freshnessStatement", "bestPriceExtrapolationStatement", "scopeStatement", "isCompletePriceGeneration", "warnings");
+        var valueInputRow = values.GetProperty("inputSchema").GetProperty("properties").GetProperty("items").GetProperty("items");
+        AssertSchemaRequired(valueInputRow, "itemId", "quantity");
+        AssertSchemaRequired(values.GetProperty("outputSchema").GetProperty("properties").GetProperty("items").GetProperty("items"), "itemId", "name", "quantity", "priceResourceStatus", "immediateSale", "acquisition", "hypotheticalListing");
+        AssertSchemaRequired(values.GetProperty("outputSchema").GetProperty("properties").GetProperty("items").GetProperty("items").GetProperty("properties").GetProperty("immediateSale"), "isAvailable", "availability", "unitQuote", "gross", "listingFee", "exchangeFee", "net");
+        AssertSchemaRequired(values.GetProperty("outputSchema").GetProperty("properties").GetProperty("items").GetProperty("items").GetProperty("properties").GetProperty("acquisition"), "isAvailable", "availability", "unitQuote", "buyerTotalCost");
+        AssertSchemaRequired(values.GetProperty("outputSchema").GetProperty("properties").GetProperty("immediateSale"), "isComplete", "missingItemIds", "gross", "listingFee", "exchangeFee", "net");
         var findItems = toolsByName["find_items"];
         var findItemsInputSchema = findItems.GetProperty("inputSchema");
         var findItemsInputProperties = findItemsInputSchema.GetProperty("properties");
@@ -180,6 +193,97 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.False(document.RootElement.GetProperty("result").TryGetProperty("isError", out var isError) && isError.GetBoolean());
         Assert.DoesNotContain("key", payload, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain("token", payload, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetItemPrices_returns_local_structured_price_facts()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(17, "tools/call", new { name = "get_item_prices", arguments = new { itemIds = new[] { 456L, 999L } } });
+        response.EnsureSuccessStatusCode();
+        using var document = JsonDocument.Parse(await ReadMcpResponseAsync(response));
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var rows = structured.GetProperty("items").EnumerateArray().ToArray();
+        Assert.Equal("Quoted", rows[0].GetProperty("status").GetString());
+        Assert.Equal("Price Fixture", rows[0].GetProperty("name").GetString());
+        Assert.Equal("NoPriceResourceInGeneration", rows[1].GetProperty("status").GetString());
+        foreach (var property in new[] { "freeAccountTradable", "buyQuantity", "highestBuyUnitPrice", "sellQuantity", "lowestSellUnitPrice", "buyOrdersAvailable", "sellOrdersAvailable" })
+        {
+            Assert.Equal(JsonValueKind.Null, rows[1].GetProperty(property).ValueKind);
+        }
+        Assert.False(rows[1].GetProperty("isPriceResourceInGeneration").GetBoolean());
+        Assert.Contains("tp --fresh", structured.GetProperty("freshnessStatement").GetString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetItemPrices_maps_initial_cache_failure_to_a_redacted_actionable_mcp_error()
+    {
+        using var errorFactory = new ErrorMcpApplicationFactory();
+        using var errorClient = errorFactory.CreateClient();
+        await InitializeAsync(errorClient);
+        using var response = await PostMcpAsync(errorClient, 18, "tools/call", new { name = "get_item_prices", arguments = new { itemIds = new[] { 456L } } });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+
+        Assert.Contains("price cache is unavailable", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-price-cache", payload, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ValueItems_returns_structured_factual_quote_arithmetic_with_explicit_nulls()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(19, "tools/call", new
+        {
+            name = "value_items",
+            arguments = new { items = new[] { new { itemId = 999L, quantity = 2L }, new { itemId = 456L, quantity = 3L } } }
+        });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+        using var document = JsonDocument.Parse(payload);
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        var rows = structured.GetProperty("items").EnumerateArray().ToArray();
+        Assert.Equal("NoPriceResourceInGeneration", rows[0].GetProperty("priceResourceStatus").GetString());
+        Assert.Equal(JsonValueKind.Null, rows[0].GetProperty("name").ValueKind);
+        Assert.Equal("Price Fixture", rows[1].GetProperty("name").GetString());
+        foreach (var property in new[] { "unitQuote", "gross", "listingFee", "exchangeFee", "net" })
+        {
+            Assert.Equal(JsonValueKind.Null, rows[0].GetProperty("immediateSale").GetProperty(property).ValueKind);
+            Assert.Equal(JsonValueKind.Null, rows[0].GetProperty("hypotheticalListing").GetProperty(property).ValueKind);
+        }
+        Assert.Equal(JsonValueKind.Null, rows[0].GetProperty("acquisition").GetProperty("unitQuote").ValueKind);
+        Assert.Equal(JsonValueKind.Null, rows[0].GetProperty("acquisition").GetProperty("buyerTotalCost").ValueKind);
+        Assert.Equal(60, rows[1].GetProperty("immediateSale").GetProperty("gross").GetInt64());
+        Assert.Equal(120, rows[1].GetProperty("acquisition").GetProperty("buyerTotalCost").GetInt64());
+        Assert.False(structured.GetProperty("immediateSale").GetProperty("isComplete").GetBoolean());
+        foreach (var property in new[] { "gross", "listingFee", "exchangeFee", "net" })
+        {
+            Assert.Equal(JsonValueKind.Null, structured.GetProperty("immediateSale").GetProperty(property).ValueKind);
+            Assert.Equal(JsonValueKind.Null, structured.GetProperty("hypotheticalListing").GetProperty(property).ValueKind);
+        }
+        Assert.Equal(JsonValueKind.Null, structured.GetProperty("acquisition").GetProperty("buyerTotalCost").ValueKind);
+        Assert.Contains("not execution guarantees", structured.GetProperty("bestPriceExtrapolationStatement").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("no buy", structured.GetProperty("scopeStatement").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("GW2_API_KEY", payload, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ValueItems_rejects_a_null_row_with_a_controlled_redacted_tool_error()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(20, "tools/call", new
+        {
+            name = "value_items",
+            arguments = new { items = new object?[] { null } }
+        });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+
+        Assert.Contains("Items must contain", payload, StringComparison.Ordinal);
+        Assert.DoesNotContain("NullReference", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("GW2_API_KEY", payload, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private", payload, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -514,6 +618,10 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
                 services.AddSingleton<IGw2ApiClient>(new FakeGw2ApiClient());
                 services.RemoveAll<IItemCacheReader>();
                 services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
+                services.RemoveAll<IPriceSnapshotProvider>();
+                services.AddSingleton<IPriceSnapshotProvider>(new FakePriceSnapshotProvider());
+                services.RemoveAll<IItemNameLookup>();
+                services.AddSingleton<IItemNameLookup>(new FakeItemNameLookup());
                 services.RemoveAll<TimeProvider>();
                 services.AddSingleton<TimeProvider>(new FixedTimeProvider());
             });
@@ -531,6 +639,10 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
                 services.AddSingleton<IGw2ApiClient>(new ErrorGw2ApiClient());
                 services.RemoveAll<IItemCacheReader>();
                 services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
+                services.RemoveAll<IPriceSnapshotProvider>();
+                services.AddSingleton<IPriceSnapshotProvider>(new EndpointUnavailablePriceSnapshotProvider());
+                services.RemoveAll<IItemNameLookup>();
+                services.AddSingleton<IItemNameLookup>(new FakeItemNameLookup());
             });
         }
     }
@@ -546,6 +658,10 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
                 services.AddSingleton<IGw2ApiClient>(new NullableHoldingsGw2ApiClient());
                 services.RemoveAll<IItemCacheReader>();
                 services.AddSingleton<IItemCacheReader>(new FakeCacheReader());
+                services.RemoveAll<IPriceSnapshotProvider>();
+                services.AddSingleton<IPriceSnapshotProvider>(new FakePriceSnapshotProvider());
+                services.RemoveAll<IItemNameLookup>();
+                services.AddSingleton<IItemNameLookup>(new FakeItemNameLookup());
             });
         }
     }
@@ -695,5 +811,19 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
     private sealed class FixedTimeProvider : TimeProvider
     {
         public override DateTimeOffset GetUtcNow() => DateTimeOffset.Parse("2026-08-12T12:00:00Z");
+    }
+
+    private sealed class FakePriceSnapshotProvider : IPriceSnapshotProvider
+    {
+        private static readonly PriceCacheSnapshot Snapshot = new([new CachedPrice(456, true, 10, 20, 30, 40)], new PriceCacheFingerprint("a".PadLeft(64, 'a'), "prices." + "a".PadLeft(64, 'a') + ".csv", DateTime.UnixEpoch, 1, DateTime.UnixEpoch, 1), DateTime.Parse("2026-08-12T11:00:00Z"), DateTime.Parse("2026-08-12T11:01:00Z"), DateTime.Parse("2026-08-12T11:02:00Z"));
+        public Task<PriceSnapshotResult> GetSnapshotAsync(CancellationToken cancellationToken) => Task.FromResult(new PriceSnapshotResult(Snapshot, null));
+    }
+    private sealed class EndpointUnavailablePriceSnapshotProvider : IPriceSnapshotProvider
+    {
+        public Task<PriceSnapshotResult> GetSnapshotAsync(CancellationToken cancellationToken) => throw new PriceCacheException("private-price-cache");
+    }
+    private sealed class FakeItemNameLookup : IItemNameLookup
+    {
+        public Task<IReadOnlyDictionary<long, string>> GetNamesAsync(CancellationToken cancellationToken) => Task.FromResult<IReadOnlyDictionary<long, string>>(new Dictionary<long, string> { [456] = "Price Fixture" });
     }
 }
