@@ -8,6 +8,651 @@ namespace GW2AccountMCP.Tests;
 public sealed class Gw2ApiClientTests
 {
     [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_returns_sorted_all_tabs_with_active_marker()
+    {
+        var handler = new RecordingHandler(
+            EquipmentPermissions,
+            EquipmentRoster,
+            """[{"tab":2,"name":"Second","is_active":false,"equipment":[{"slot":"Relic","id":2,"location":"Armory"}]},{"tab":1,"name":"First","is_active":true,"equipment":[{"slot":"Helm","id":1,"location":"Equipped"},{"slot":"Relic","id":3,"location":"Equipped"}]}]""",
+            """[{"id":1,"name":"Helm","type":"Armor","rarity":"Rare","level":80},{"id":2,"name":"Relic","type":"UpgradeComponent","rarity":"Rare","level":80},{"id":3,"name":"Relic","type":"UpgradeComponent","rarity":"Rare","level":80}]"""
+        );
+        using var httpClient = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        Gw2CharacterEquipmentTabs tabs = await EquipmentClient(httpClient).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal("Synthetic Hero", tabs.CharacterName);
+        Assert.Equal(1, tabs.ActiveTab);
+        Assert.Equal([1, 2], tabs.Tabs.Select(tab => tab.Tab));
+        Assert.Equal([true, false], tabs.Tabs.Select(tab => tab.IsActive));
+        Assert.Equal(["Helm", "Relic"], tabs.Tabs[0].Equipment.Select(row => row.Slot));
+        Assert.Equal("EquipmentTemplateReference", tabs.Tabs[1].Equipment[0].ReferenceKind);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_requests_authenticated_sources_in_required_order()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]"), ItemMetadata([1]));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.Equal(["/v2/tokeninfo?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/characters/Synthetic%20Hero/equipmenttabs?lang=en&v=2025-08-29T01%3A00%3A00.000Z", "/v2/items?ids=1&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" \t")]
+    public async Task GetCharacterEquipmentTabsAsync_validates_input_key_permissions_roster_status_and_exact_name(string name)
+    {
+        var handler = new RecordingHandler();
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync(name, CancellationToken.None));
+        Assert.Empty(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_non200_or_malformed_all_tabs()
+    {
+        foreach (var response in new object[] { new ResponseSpec("{}", HttpStatusCode.OK), new ResponseSpec("[]", HttpStatusCode.PartialContent), new ResponseSpec("[]", HttpStatusCode.InternalServerError) })
+        {
+            var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, response);
+            using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+        }
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_accepts_empty_tabs_without_fallback_or_metadata()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, "[]");
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.Null(result.ActiveTab); Assert.Empty(result.Tabs); Assert.Equal(3, handler.RequestUris.Count);
+        Assert.Null(result.EquipmentAsOf); Assert.Null(result.ItemsAsOf); Assert.Null(result.ItemStatsAsOf); Assert.Null(result.SkinsAsOf);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_returns_all_tabs_not_an_inactive_only_view()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, "[" + Tab(1, true, "[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]") + "," + Tab(2, false, "[{\"slot\":\"Relic\",\"id\":2,\"location\":\"Armory\"}]") + "]", ItemMetadata([1, 2]));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        Assert.Equal(2, (await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Tabs.Count);
+    }
+
+    [Theory]
+    [InlineData("[{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":[]}]", false)]
+    [InlineData("[{\"tab\":0,\"name\":\"\",\"is_active\":true,\"equipment\":[]}]", true)]
+    [InlineData("[{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":[]},{\"tab\":1,\"name\":\"\",\"is_active\":false,\"equipment\":[]}]", true)]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_invalid_active_tab_cardinality_or_duplicate_tab_id(string payload, bool rejects)
+    {
+        var handler = rejects
+            ? new RecordingHandler(EquipmentPermissions, EquipmentRoster, payload)
+            : new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]"), ItemMetadata([1]));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        if (rejects) await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+        else Assert.Single((await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Tabs);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_orders_slots_retains_unknowns_and_excludes_noncombat_and_pvp()
+    {
+        var rows = "[{\"slot\":\"Future\",\"id\":3,\"location\":\"Future\"},{\"slot\":\"WeaponA1\",\"id\":2,\"location\":\"Equipped\"},{\"slot\":\"Sickle\"},{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Relic\",\"id\":4,\"location\":\"Equipped\"}]";
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs(rows), ItemMetadata([1, 2, 3, 4]));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var equipment = Assert.Single((await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Tabs).Equipment;
+        Assert.Equal(["Helm", "WeaponA1", "Relic", "Future"], equipment.Select(row => row.Slot));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_an_over_limit_unknown_slot_before_excluding_known_slots()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster,
+            Tabs("[{\"slot\":\"" + new string('x', 257) + "\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\"}]"));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+        Assert.Equal(3, handler.RequestUris.Count);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_validates_missing_key_each_permission_roster_status_and_ordinal_name()
+    {
+        using (var http = new HttpClient(new RecordingHandler()) { BaseAddress = new Uri("https://example.test") })
+        {
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(http, new Gw2ApiOptions("", "https://example.test")).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+        }
+
+        foreach (var missing in new[] { "account", "characters", "builds", "inventories" })
+        {
+            var permissions = new[] { "account", "characters", "builds", "inventories" }.Where(permission => permission != missing);
+            var handler = new RecordingHandler("{\"permissions\":[" + string.Join(',', permissions.Select(permission => "\"" + permission + "\"")) + "]}");
+            using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+            Assert.Contains(missing + " permission", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Single(handler.RequestUris);
+        }
+
+        foreach (var status in new[] { HttpStatusCode.PartialContent, HttpStatusCode.InternalServerError })
+        {
+            var handler = new RecordingHandler(EquipmentPermissions, new ResponseSpec("[\"Synthetic Hero\"]", status));
+            using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+        }
+
+        var nonOrdinal = new RecordingHandler(EquipmentPermissions, "[\"synthetic hero\"]");
+        using var nonOrdinalHttp = new HttpClient(nonOrdinal) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(nonOrdinalHttp).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+        Assert.Equal(2, nonOrdinal.RequestUris.Count);
+    }
+
+    [Theory]
+    [InlineData("[{\"tab\":1,\"name\":\"\",\"is_active\":false,\"equipment\":[]}]")]
+    [InlineData("[{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":[]},{\"tab\":2,\"name\":\"\",\"is_active\":true,\"equipment\":[]}]")]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_zero_or_multiple_active_tabs(string payload)
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, payload);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_enforces_all_authenticated_body_row_child_and_aggregate_bounds()
+    {
+        await AssertEquipmentTabsBoundaryAsync(TabsPayloadAtBytes(2 * 1024 * 1024), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(TabsPayloadAtBytes(2 * 1024 * 1024 + 1), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync("[" + string.Join(',', Enumerable.Range(1, 16).Select(id => Tab(id, id == 1, "[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]"))) + "]", rejects: false);
+        await AssertEquipmentTabsBoundaryAsync("[" + string.Join(',', Enumerable.Range(1, 17).Select(id => Tab(id, id == 1, "[]"))) + "]", rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[" + string.Join(',', Enumerable.Repeat("{\"slot\":\"Sickle\"}", 63).Append("{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}")) + "]"), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[" + string.Join(',', Enumerable.Repeat("{\"slot\":\"Sickle\"}", 64).Append("{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}")) + "]"), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(RawTabs(512), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(RawTabs(513), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"upgrades\":[" + string.Join(',', Enumerable.Repeat("1", 16)) + "],\"infusions\":[" + string.Join(',', Enumerable.Repeat("1", 16)) + "]}]"), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"upgrades\":[" + string.Join(',', Enumerable.Repeat("1", 17)) + "]}]"), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"infusions\":[" + string.Join(',', Enumerable.Repeat("1", 17)) + "]}]"), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(Tabs(StatRow(32)), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(Tabs(StatRow(33)), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(RawTabs(512, 7), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(RawTabs(512, 7, extraReferences: 1), rejects: true);
+        await AssertEquipmentTabsBoundaryAsync(RawTabs(128, 0, attributesPerRow: 32), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(RawTabs(128, 0, attributesPerRow: 32, extraAttributes: 1), rejects: true);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_enforces_fallback_body_and_row_boundaries()
+    {
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[]"), false, FallbackPayloadAtBytes(2 * 1024 * 1024));
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[]"), true, FallbackPayloadAtBytes(2 * 1024 * 1024 + 1));
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[]"), false, FallbackRows(512));
+        await AssertEquipmentTabsBoundaryAsync(Tabs("[]"), true, FallbackRows(513));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_enforces_each_authenticated_string_boundary()
+    {
+        foreach (var field in new[] { "name", "slot", "location", "binding", "bound_to", "attribute" })
+        {
+            await AssertEquipmentTabsBoundaryAsync(StringBoundaryTabs(field, 256), rejects: false);
+            await AssertEquipmentTabsBoundaryAsync(StringBoundaryTabs(field, 257), rejects: true);
+        }
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_counts_resolver_qualified_metadata_identities_before_and_after_default_derivation()
+    {
+        var accepted = new RoutingHandler(request => EquipmentTabsResponse(request, DistinctNamespaceTabs(4094), null));
+        using (var http = new HttpClient(accepted) { BaseAddress = new Uri("https://example.test") })
+        {
+            await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+            Assert.Equal(21, accepted.RequestUris.Count(uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal)));
+            Assert.Single(accepted.RequestUris, uri => uri.StartsWith("/v2/itemstats?", StringComparison.Ordinal));
+            Assert.Single(accepted.RequestUris, uri => uri.StartsWith("/v2/skins?", StringComparison.Ordinal));
+        }
+
+        var initialOverLimit = new RoutingHandler(request => EquipmentTabsResponse(request, DistinctNamespaceTabs(4095), null));
+        using (var http = new HttpClient(initialOverLimit) { BaseAddress = new Uri("https://example.test") })
+        {
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+            Assert.DoesNotContain(initialOverLimit.RequestUris, uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal));
+        }
+
+        var derivedOverLimit = new RoutingHandler(request => EquipmentTabsResponse(request, DistinctItemTabs(), null, defaultStatForFirstItem: true));
+        using (var http = new HttpClient(derivedOverLimit) { BaseAddress = new Uri("https://example.test") })
+        {
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+            Assert.Equal(21, derivedOverLimit.RequestUris.Count(uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal)));
+            Assert.DoesNotContain(derivedOverLimit.RequestUris, uri => uri.StartsWith("/v2/itemstats?", StringComparison.Ordinal) || uri.StartsWith("/v2/skins?", StringComparison.Ordinal));
+        }
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_routes_equal_numeric_ids_to_each_metadata_resolver()
+    {
+        var handler = new RoutingHandler(request => EquipmentTabsResponse(request,
+            Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"skin\":1,\"stats\":{\"id\":1,\"attributes\":{}}}]"), null));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.Contains(handler.RequestUris, uri => uri.StartsWith("/v2/items?ids=1", StringComparison.Ordinal));
+        Assert.Contains(handler.RequestUris, uri => uri.StartsWith("/v2/itemstats?ids=1", StringComparison.Ordinal));
+        Assert.Contains(handler.RequestUris, uri => uri.StartsWith("/v2/skins?ids=1", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("not-found")]
+    [InlineData("other-status")]
+    [InlineData("malformed")]
+    [InlineData("invalid-200")]
+    [InlineData("invalid-206")]
+    [InlineData("transport")]
+    [InlineData("timeout")]
+    public async Task GetCharacterEquipmentTabsAsync_degrades_each_invalid_metadata_batch_and_continues_later_batches(string failure)
+    {
+        var itemBatch = 0;
+        var tabs = UniqueItemsTabs(201).Replace(
+            "{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}",
+            "{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"skin\":1,\"stats\":{\"id\":1,\"attributes\":{}}}",
+            StringComparison.Ordinal);
+        var handler = new RoutingHandler(request =>
+        {
+            var path = request.RequestUri!.PathAndQuery;
+            if (!path.StartsWith("/v2/items?", StringComparison.Ordinal)) return EquipmentTabsResponse(request, tabs, null);
+            itemBatch++;
+            if (itemBatch == 1)
+            {
+                return failure switch
+                {
+                    "not-found" => JsonResponse("[]", HttpStatusCode.NotFound),
+                    "other-status" => JsonResponse("[]", (HttpStatusCode)418),
+                    "malformed" => JsonResponse("not-json"),
+                    "invalid-200" => JsonResponse("[]"),
+                    "invalid-206" => JsonResponse("[]", HttpStatusCode.PartialContent),
+                    "transport" => throw new HttpRequestException("private metadata transport failure"),
+                    _ => throw new OperationCanceledException("metadata timeout")
+                };
+            }
+            return EquipmentTabsResponse(request, tabs, null);
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.False(result.IsMetadataComplete);
+        Assert.Equal([
+            "/v2/items?ids=" + string.Join("%2C", Enumerable.Range(1, 200)) + "&lang=en&v=2025-08-29T01%3A00%3A00.000Z",
+            "/v2/items?ids=201&lang=en&v=2025-08-29T01%3A00%3A00.000Z"], handler.RequestUris.Where(uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal)));
+        Assert.Null(result.Tabs.SelectMany(tab => tab.Equipment).Single(row => row.Item.Id == 1).Item.Name);
+        Assert.Equal("Item 201", result.Tabs.SelectMany(tab => tab.Equipment).Single(row => row.Item.Id == 201).Item.Name);
+        Assert.Contains(handler.RequestUris, uri => uri.StartsWith("/v2/itemstats?ids=1", StringComparison.Ordinal));
+        Assert.Contains(handler.RequestUris, uri => uri.StartsWith("/v2/skins?ids=1", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_uses_selected_and_default_stats_and_skips_unneeded_metadata_sources()
+    {
+        var handler = new RoutingHandler(request =>
+        {
+            var path = request.RequestUri!.PathAndQuery;
+            if (path.StartsWith("/v2/items?", StringComparison.Ordinal))
+            {
+                return JsonResponse("[{\"id\":1,\"name\":\"One\",\"type\":\"Armor\",\"rarity\":\"Rare\",\"level\":80,\"details\":{\"infix_upgrade\":{\"id\":2}}},{\"id\":2,\"name\":\"Two\",\"type\":\"UpgradeComponent\",\"rarity\":\"Rare\",\"level\":80}]");
+            }
+            return EquipmentTabsResponse(request, Tabs("[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\",\"stats\":{\"id\":3,\"attributes\":{}}}]"), null);
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.Equal([2L, 3L], result.Tabs.Single().Equipment.Select(row => row.Stats!.Id).Order());
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.StartsWith("/v2/skins?", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_caps_exact_metadata_warnings_without_hiding_unresolved_canonical_rows()
+    {
+        var exactly256 = new RoutingHandler(request => MetadataNotFoundResponse(request, UniqueItemsTabs(256)));
+        using (var http = new HttpClient(exactly256) { BaseAddress = new Uri("https://example.test") })
+        {
+            var result = await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+            Assert.Equal(256, result.Warnings.Count);
+            Assert.All(result.Warnings, warning => Assert.Equal("metadata_unresolved", warning.Code));
+            Assert.Null(result.Tabs.SelectMany(tab => tab.Equipment).Single(row => row.Item.Id == 1).Item.Name);
+        }
+
+        var singleResolverOverflow = new RoutingHandler(request => MetadataNotFoundResponse(request, UniqueItemsTabs(257)));
+        using (var http = new HttpClient(singleResolverOverflow) { BaseAddress = new Uri("https://example.test") })
+        {
+            var warnings = (await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Warnings;
+            Assert.Equal(256, warnings.Count);
+            Assert.All(warnings.Take(255), warning => Assert.Equal(("metadata_unresolved", "items"), (warning.Code, warning.Resolver)));
+            Assert.Equal(("metadata_warning_limit_reached", "items", "2"), (warnings[^1].Code, warnings[^1].Resolver, warnings[^1].ReferenceId));
+        }
+
+        var mixedOverflow = new RoutingHandler(request => MetadataNotFoundResponse(request, DistinctNamespaceTabs(255)));
+        using (var http = new HttpClient(mixedOverflow) { BaseAddress = new Uri("https://example.test") })
+        {
+            var warnings = (await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Warnings;
+            Assert.Equal(("metadata_warning_limit_reached", "multiple", "2"), (warnings[^1].Code, warnings[^1].Resolver, warnings[^1].ReferenceId));
+        }
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_redacts_essential_post_header_timeout_and_stops_before_roster()
+    {
+        var clock = new DeferredTimerTimeProvider();
+        var handler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(clock) });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(http, new Gw2ApiOptions(new string('k', 16), "https://example.test"), clock).GetCharacterEquipmentTabsAsync("Secret Hero", CancellationToken.None));
+        Assert.True(clock.Fired);
+        Assert.Single(handler.RequestUris);
+        Assert.DoesNotContain("Secret", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_degrades_optional_post_header_timeout_and_continues_later_batches()
+    {
+        var clock = new DeferredTimerTimeProvider();
+        var firstMetadata = true;
+        var handler = new RoutingHandler(request =>
+        {
+            if (request.RequestUri!.PathAndQuery.StartsWith("/v2/items?", StringComparison.Ordinal) && firstMetadata)
+            {
+                firstMetadata = false;
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StallingHttpContent(clock) };
+            }
+            return EquipmentTabsResponse(request, UniqueItemsTabs(201), null);
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await new Gw2ApiClient(http, new Gw2ApiOptions(new string('k', 16), "https://example.test"), clock).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.True(clock.Fired);
+        Assert.False(result.IsMetadataComplete);
+        Assert.Equal("Item 201", result.Tabs.SelectMany(tab => tab.Equipment).Single(row => row.Item.Id == 201).Item.Name);
+    }
+
+    [Theory]
+    [InlineData("{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]}")]
+    [InlineData("{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"tabs\":[1,1]}]}")]
+    [InlineData("{\"equipment\":[]}")]
+    [InlineData("{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"tabs\":[1]},{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\",\"tabs\":[1]}]}")]
+    [InlineData("{\"equipment\":[{\"slot\":\"Relic\",\"location\":\"Equipped\",\"tabs\":[1]}]}")]
+    [InlineData("{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"tabs\":[2]}]}")]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_each_strict_relic_fallback_mapping_failure(string fallback)
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[]"), fallback);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(4, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.PartialContent, "{\"equipment\":[]}")]
+    [InlineData(HttpStatusCode.OK, "not-json")]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_non200_or_malformed_relic_fallback_body(HttpStatusCode status, string fallback)
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[]"), new ResponseSpec(fallback, status));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+
+        Assert.Equal(4, handler.RequestUris.Count);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_enforces_true_aggregate_selected_stat_attribute_occurrences()
+    {
+        await AssertEquipmentTabsBoundaryAsync(TabsWithSelectedStatAttributes(4096), rejects: false);
+        await AssertEquipmentTabsBoundaryAsync(TabsWithSelectedStatAttributes(4097), rejects: true);
+    }
+
+    [Theory]
+    [InlineData("roster", 2)]
+    [InlineData("all-tabs", 3)]
+    [InlineData("fallback", 4)]
+    public async Task GetCharacterEquipmentTabsAsync_redacts_and_stops_after_each_essential_authenticated_post_header_timeout(string stage, int expectedCalls)
+    {
+        var clock = new DeferredTimerTimeProvider();
+        var stalled = new TrackedStallingHttpContent(clock);
+        var handler = stage switch
+        {
+            "roster" => new RecordingHandler(EquipmentPermissions, new HttpResponseMessage(HttpStatusCode.OK) { Content = stalled }),
+            "all-tabs" => new RecordingHandler(EquipmentPermissions, "[\"Secret Hero\"]", new HttpResponseMessage(HttpStatusCode.OK) { Content = stalled }),
+            "fallback" => new RecordingHandler(EquipmentPermissions, "[\"Secret Hero\"]", Tabs("[]"), new HttpResponseMessage(HttpStatusCode.OK) { Content = stalled }),
+            _ => throw new ArgumentOutOfRangeException(nameof(stage))
+        };
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => new Gw2ApiClient(http, new Gw2ApiOptions(new string('k', 16), "https://example.test"), clock).GetCharacterEquipmentTabsAsync("Secret Hero", CancellationToken.None));
+
+        Assert.Equal(expectedCalls, handler.RequestUris.Count);
+        Assert.True(clock.Fired);
+        Assert.True(stalled.IsDisposed);
+        Assert.Contains("timed out", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Secret", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_degrades_metadata_post_header_timeout_through_later_item_batches_stats_and_skins()
+    {
+        var clock = new DeferredTimerTimeProvider();
+        var firstItems = true;
+        var tabs = UniqueItemsTabs(201).Replace(
+            "{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}",
+            "{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"skin\":1,\"stats\":{\"id\":1,\"attributes\":{}}}",
+            StringComparison.Ordinal);
+        var handler = new RoutingHandler(request =>
+        {
+            var path = request.RequestUri!.PathAndQuery;
+            if (path.StartsWith("/v2/items?", StringComparison.Ordinal) && firstItems)
+            {
+                firstItems = false;
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new TrackedStallingHttpContent(clock) };
+            }
+            return EquipmentTabsResponse(request, tabs, null);
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(http, new Gw2ApiOptions(new string('k', 16), "https://example.test"), clock).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.True(clock.Fired);
+        Assert.False(result.IsMetadataComplete);
+        var relic = result.Tabs.SelectMany(tab => tab.Equipment).Single(row => row.Item.Id == 1);
+        Assert.Equal((1L, (string?)null, 1L, (string?)"Metadata", 1L, (string?)"Metadata"), (relic.Item.Id, relic.Item.Name, relic.Stats!.Id, relic.Stats.Name, relic.Skin!.Id, relic.Skin.Name));
+        Assert.Equal("Item 201", result.Tabs.SelectMany(tab => tab.Equipment).Single(row => row.Item.Id == 201).Item.Name);
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.StartsWith("/v2/items?", StringComparison.Ordinal)));
+        Assert.Single(handler.RequestUris, uri => uri.StartsWith("/v2/itemstats?ids=1", StringComparison.Ordinal));
+        Assert.Single(handler.RequestUris, uri => uri.StartsWith("/v2/skins?ids=1", StringComparison.Ordinal));
+        Assert.Contains(result.Warnings, warning => (warning.Code, warning.Resolver, warning.ReferenceId) == ("metadata_unresolved", "items", "1"));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_disposes_successful_responses_through_fallback_and_metadata_parsing()
+    {
+        var contents = new List<TrackedJsonContent>();
+        HttpResponseMessage Response(string content)
+        {
+            var tracked = new TrackedJsonContent(content);
+            contents.Add(tracked);
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = tracked };
+        }
+
+        var handler = new RoutingHandler(request =>
+        {
+            var path = request.RequestUri!.PathAndQuery;
+            if (path.StartsWith("/v2/tokeninfo", StringComparison.Ordinal)) return Response(EquipmentPermissions);
+            if (path.StartsWith("/v2/characters?", StringComparison.Ordinal)) return Response(EquipmentRoster);
+            if (path.Contains("/equipmenttabs?", StringComparison.Ordinal)) return Response(Tabs("[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\",\"skin\":4}]"));
+            if (path.Contains("/equipment?", StringComparison.Ordinal)) return Response("{\"equipment\":[{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\",\"tabs\":[1],\"stats\":{\"id\":3,\"attributes\":{}}}]}");
+            if (path.StartsWith("/v2/items?", StringComparison.Ordinal)) return Response("[{\"id\":1,\"name\":\"Helm\",\"type\":\"Armor\",\"rarity\":\"Rare\",\"level\":80},{\"id\":2,\"name\":\"Relic\",\"type\":\"UpgradeComponent\",\"rarity\":\"Rare\",\"level\":80}]");
+            if (path.StartsWith("/v2/itemstats?", StringComparison.Ordinal)) return Response("[{\"id\":3,\"name\":\"Selected\"}]");
+            if (path.StartsWith("/v2/skins?", StringComparison.Ordinal)) return Response("[{\"id\":4,\"name\":\"Skin\"}]");
+            throw new InvalidOperationException("Unexpected route.");
+        });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+
+        Assert.Equal(7, contents.Count);
+        Assert.All(contents, content => Assert.True(content.IsDisposed));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_records_exact_ordered_completion_timestamps_after_fallback()
+    {
+        var clock = new SequenceTimeProvider();
+        var handler = new RecordingHandler(
+            EquipmentPermissions,
+            EquipmentRoster,
+            Tabs("[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\",\"skin\":4}]"),
+            "{\"equipment\":[{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\",\"tabs\":[1],\"stats\":{\"id\":3,\"attributes\":{}}}]}",
+            "[{\"id\":1,\"name\":\"Helm\",\"type\":\"Armor\",\"rarity\":\"Rare\",\"level\":80},{\"id\":2,\"name\":\"Relic\",\"type\":\"UpgradeComponent\",\"rarity\":\"Rare\",\"level\":80}]",
+            "[{\"id\":3,\"name\":\"Selected\"}]",
+            "[{\"id\":4,\"name\":\"Skin\"}]");
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+
+        var result = await new Gw2ApiClient(http, new Gw2ApiOptions(new string('k', 16), "https://example.test"), clock).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+
+        var start = DateTimeOffset.Parse("2026-08-16T12:00:00Z");
+        Assert.Equal(start, result.EquipmentTabsAsOf);
+        Assert.Equal(start.AddSeconds(1), result.EquipmentAsOf);
+        Assert.Equal(start.AddSeconds(2), result.ItemsAsOf);
+        Assert.Equal(start.AddSeconds(3), result.ItemStatsAsOf);
+        Assert.Equal(start.AddSeconds(4), result.SkinsAsOf);
+        Assert.Equal(start.AddSeconds(5), result.AsOf);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_propagates_caller_cancellation_during_body_parse()
+    {
+        using var source = new CancellationTokenSource();
+        var handler = new RecordingHandler(new HttpResponseMessage(HttpStatusCode.OK) { Content = new CancelOnReadHttpContent(source) });
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", source.Token));
+        Assert.Single(handler.RequestUris);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_duplicate_retained_slot_and_malformed_required_fields()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Helm\",\"id\":2,\"location\":\"Equipped\"}]"));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_completes_relics_only_from_explicit_tab_membership()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, "[" + Tab(1, true, "[]") + "," + Tab(2, false, "[]") + "]", "{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Armory\",\"tabs\":[1,2]}]}", ItemMetadata([1]));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        Assert.All((await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Tabs, tab => Assert.Single(tab.Equipment));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_rejects_ambiguous_or_invalid_relic_fallback_membership()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[]"), "{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"tabs\":[2]}]}");
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_skips_relic_fallback_when_complete()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]"), ItemMetadata([1]));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/equipment?", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("Armory", "EquipmentTemplateReference")]
+    [InlineData("LegendaryArmory", "LegendaryArmoryReference")]
+    [InlineData("EquippedFromLegendaryArmory", "LegendaryArmoryReference")]
+    [InlineData("FutureLocation", "UnknownEquipmentReference")]
+    public async Task GetCharacterEquipmentTabsAsync_preserves_primary_and_fallback_locations_as_nonownership_reference_kinds(string location, string kind)
+    {
+        var primary = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"" + location + "\"}]"), ItemMetadata([1]));
+        using var primaryHttp = new HttpClient(primary) { BaseAddress = new Uri("https://example.test") };
+        var row = Assert.Single(Assert.Single((await EquipmentClient(primaryHttp).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Tabs).Equipment);
+        Assert.Equal((location, kind), (row.Location, row.ReferenceKind));
+
+        var fallback = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[]"), "{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"" + location + "\",\"tabs\":[1]}]}", ItemMetadata([1]));
+        using var fallbackHttp = new HttpClient(fallback) { BaseAddress = new Uri("https://example.test") };
+        var fallbackRow = Assert.Single(Assert.Single((await EquipmentClient(fallbackHttp).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Tabs).Equipment);
+        Assert.Equal((location, kind), (fallbackRow.Location, fallbackRow.ReferenceKind));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_enforces_equipment_tab_product_bounds()
+    {
+        var seventeenTabs = "[" + string.Join(',', Enumerable.Range(1, 17).Select(id => Tab(id, id == 1, "[]"))) + "]";
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, seventeenTabs);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_batches_metadata_in_ascending_chunks_and_continues_after_degradation()
+    {
+        var ids = Enumerable.Range(1, 201).Select(id => (long)id).ToArray();
+        var rows = "[" + string.Join(',', Enumerable.Range(1, 16).Select(slot => "{\"slot\":\"Future" + slot + "\",\"id\":" + slot + ",\"location\":\"Equipped\",\"upgrades\":[" + string.Join(',', Enumerable.Range(slot * 20, 16).Select(id => id.ToString())) + "]}")) + ",{\"slot\":\"Relic\",\"id\":201,\"location\":\"Equipped\"}]";
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs(rows), new ResponseSpec("[]", HttpStatusCode.NotFound), ItemMetadata(ids.Skip(200)));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.False(result.IsMetadataComplete);
+        Assert.Equal(2, handler.RequestUris.Count(uri => uri.Contains("/v2/items?", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_handles_metadata_200_206_404_and_invalid_batches()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\"}]"), new ResponseSpec("[{\"id\":1,\"name\":\"One\",\"type\":\"Armor\",\"rarity\":\"Rare\",\"level\":80}]", HttpStatusCode.PartialContent));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.False(result.IsMetadataComplete);
+        Assert.Equal("One", result.Tabs.Single().Equipment.Single(row => row.Item.Id == 1).Item.Name);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_caps_metadata_warnings_without_hiding_unresolved_ids()
+    {
+        var rows = "[" + string.Join(',', Enumerable.Range(1, 16).Select(slot => "{\"slot\":\"Future" + slot + "\",\"id\":" + slot + ",\"location\":\"Equipped\",\"upgrades\":[" + string.Join(',', Enumerable.Range(1000 + slot * 16, 16)) + "]}")) + ",{\"slot\":\"Relic\",\"id\":999,\"location\":\"Equipped\"}]";
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs(rows), new ResponseSpec("[]", HttpStatusCode.NotFound), new ResponseSpec("[]", HttpStatusCode.NotFound));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var warnings = (await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None)).Warnings;
+        Assert.Equal(256, warnings.Count);
+        Assert.Equal("metadata_warning_limit_reached", warnings[^1].Code);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_derives_default_stats_and_records_source_timestamps_as_non_atomic()
+    {
+        var handler = new RecordingHandler(EquipmentPermissions, EquipmentRoster, Tabs("[{\"slot\":\"Helm\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\"}]"), "[{\"id\":1,\"name\":\"Helm\",\"type\":\"Armor\",\"rarity\":\"Rare\",\"level\":80,\"details\":{\"infix_upgrade\":{\"id\":3}}},{\"id\":2,\"name\":\"Relic\",\"type\":\"UpgradeComponent\",\"rarity\":\"Rare\",\"level\":80}]", "[{\"id\":3,\"name\":\"Default\"}]");
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var result = await new Gw2ApiClient(http, new Gw2ApiOptions(new string('k', 16), "https://example.test"), new SequenceTimeProvider()).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        Assert.Equal("ItemDefault", result.Tabs.Single().Equipment.Single(row => row.Item.Id == 1).Stats!.Source);
+        Assert.NotNull(result.ItemsAsOf); Assert.NotNull(result.ItemStatsAsOf); Assert.Null(result.SkinsAsOf); Assert.True(result.AsOf >= result.EquipmentTabsAsOf);
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_propagates_caller_cancellation()
+    {
+        using var source = new CancellationTokenSource();
+        source.Cancel();
+        var handler = new RecordingHandler(EquipmentPermissions);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", source.Token));
+    }
+
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_redacts_transport_failure_and_disposes_response()
+    {
+        var tracked = new ThrowingTrackedHttpContent();
+        var response = new HttpResponseMessage(HttpStatusCode.OK) { Content = tracked };
+        var handler = new RecordingHandler(response);
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        var error = await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Secret Hero", CancellationToken.None));
+        Assert.True(tracked.IsDisposed);
+        Assert.DoesNotContain("Secret", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task GetCharacterEquipmentAsync_selects_exact_roster_name_and_uses_encoded_active_route()
     {
         var handler = new RecordingHandler(
@@ -4362,7 +5007,168 @@ public sealed class Gw2ApiClientTests
     private static string ItemMetadata(IEnumerable<long> ids) => "[" + string.Join(',', ids.Select(id => id <= 201
         ? "{\"id\":" + id + ",\"name\":\"Item " + id + "\",\"type\":\"Weapon\",\"rarity\":\"Rare\",\"level\":80}"
         : "{\"id\":" + id + ",\"name\":\"Bag " + id + "\"}")) + "]";
+
+    private static async Task AssertEquipmentTabsBoundaryAsync(string tabs, bool rejects, string? fallback = null)
+    {
+        var handler = new RoutingHandler(request => EquipmentTabsResponse(request, tabs, fallback));
+        using var http = new HttpClient(handler) { BaseAddress = new Uri("https://example.test") };
+        if (rejects)
+        {
+            await Assert.ThrowsAsync<Gw2ConfigurationException>(() => EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None));
+            Assert.DoesNotContain(handler.RequestUris, uri => uri.Contains("/v2/items?", StringComparison.Ordinal));
+        }
+        else
+        {
+            await EquipmentClient(http).GetCharacterEquipmentTabsAsync("Synthetic Hero", CancellationToken.None);
+        }
+    }
+
+    private static HttpResponseMessage EquipmentTabsResponse(HttpRequestMessage request, string tabs, string? fallback, bool defaultStatForFirstItem = false)
+    {
+        var path = request.RequestUri!.PathAndQuery;
+        if (path.StartsWith("/v2/tokeninfo", StringComparison.Ordinal)) return JsonResponse(EquipmentPermissions);
+        if (path.StartsWith("/v2/characters?", StringComparison.Ordinal)) return JsonResponse(EquipmentRoster);
+        if (path.Contains("/equipmenttabs?", StringComparison.Ordinal)) return JsonResponse(tabs);
+        if (path.Contains("/equipment?", StringComparison.Ordinal)) return JsonResponse(fallback ?? "{\"equipment\":[]}");
+        var ids = Uri.UnescapeDataString(path[(path.IndexOf("ids=", StringComparison.Ordinal) + 4)..].Split('&')[0]).Split(',').Select(long.Parse).ToArray();
+        return path.StartsWith("/v2/items?", StringComparison.Ordinal)
+            ? JsonResponse("[" + string.Join(',', ids.Select(id => "{\"id\":" + id + ",\"name\":\"Item " + id + "\",\"type\":\"Weapon\",\"rarity\":\"Rare\",\"level\":80" + (defaultStatForFirstItem && id == 1 ? ",\"details\":{\"infix_upgrade\":{\"id\":5000}}" : "") + "}")) + "]")
+            : JsonResponse("[" + string.Join(',', ids.Select(id => "{\"id\":" + id + ",\"name\":\"Metadata\"}")) + "]");
+    }
+
+    private static HttpResponseMessage MetadataNotFoundResponse(HttpRequestMessage request, string tabs)
+    {
+        var path = request.RequestUri!.PathAndQuery;
+        return path.StartsWith("/v2/items?", StringComparison.Ordinal)
+            || path.StartsWith("/v2/itemstats?", StringComparison.Ordinal)
+            || path.StartsWith("/v2/skins?", StringComparison.Ordinal)
+            ? JsonResponse("[]", HttpStatusCode.NotFound)
+            : EquipmentTabsResponse(request, tabs, null);
+    }
+
+    private static HttpResponseMessage JsonResponse(string content, HttpStatusCode status = HttpStatusCode.OK) =>
+        new(status) { Content = new StringContent(content, Encoding.UTF8, "application/json") };
+
+    private static string TabsPayloadAtBytes(int bytes)
+    {
+        const string prefix = "[{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}],\"padding\":\"";
+        const string suffix = "\"}]";
+        return prefix + new string('x', bytes - Encoding.UTF8.GetByteCount(prefix + suffix)) + suffix;
+    }
+
+    private static string FallbackPayloadAtBytes(int bytes)
+    {
+        const string prefix = "{\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"tabs\":[1],\"padding\":\"";
+        const string suffix = "\"}]}";
+        return prefix + new string('x', bytes - Encoding.UTF8.GetByteCount(prefix + suffix)) + suffix;
+    }
+
+    private static string FallbackRows(int count) => "{\"equipment\":[" + string.Join(',', Enumerable.Repeat("{\"slot\":\"Helm\"}", count - 1).Append("{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"tabs\":[1]}")) + "]}";
+
+    private static string RawTabs(int rawRows, int upgradesPerRow = 0, int attributesPerRow = 0, int extraReferences = 0, int extraAttributes = 0)
+    {
+        var tabCount = (rawRows + 63) / 64;
+        var remaining = rawRows;
+        var tabs = new List<string>();
+        for (var tab = 1; tab <= tabCount; tab++)
+        {
+            var count = Math.Min(64, remaining);
+            remaining -= count;
+            var rows = new List<string>();
+            for (var row = 0; row < count; row++)
+            {
+                var slot = row == 0 ? "Relic" : "Future" + tab + "_" + row;
+                var upgrades = upgradesPerRow + (tab == 1 && row == 0 ? extraReferences : 0);
+                var attributes = attributesPerRow + (tab == 1 && row == 0 ? extraAttributes : 0);
+                rows.Add("{\"slot\":\"" + slot + "\",\"id\":1,\"location\":\"Equipped\""
+                    + (upgrades == 0 ? "" : ",\"upgrades\":[" + string.Join(',', Enumerable.Repeat("1", upgrades)) + "]")
+                    + (attributes == 0 ? "" : ",\"stats\":{\"id\":2,\"attributes\":{" + string.Join(',', Enumerable.Range(1, attributes).Select(id => "\"A" + id + "\":1")) + "}}") + "}");
+            }
+            tabs.Add(Tab(tab, tab == 1, "[" + string.Join(',', rows) + "]"));
+        }
+        return "[" + string.Join(',', tabs) + "]";
+    }
+
+    private static string TabsWithSelectedStatAttributes(int occurrences)
+    {
+        var tabs = new List<string>();
+        var remaining = occurrences;
+        for (var tab = 1; remaining > 0; tab++)
+        {
+            var rows = new List<string>();
+            for (var row = 0; row < 64 && remaining > 0; row++)
+            {
+                var attributes = Math.Min(32, remaining);
+                remaining -= attributes;
+                rows.Add("{\"slot\":\"" + (row == 0 ? "Relic" : "Future" + tab + "_" + row) + "\",\"id\":1,\"location\":\"Equipped\",\"stats\":{\"id\":2,\"attributes\":{" + string.Join(',', Enumerable.Range(1, attributes).Select(id => "\"A" + id + "\":1")) + "}}}");
+            }
+            tabs.Add(Tab(tab, tab == 1, "[" + string.Join(',', rows) + "]"));
+        }
+        return "[" + string.Join(',', tabs) + "]";
+    }
+
+    private static string DistinctItemTabs() => DistinctTabs(Enumerable.Range(1, 4096).Select(id => (long)id).ToArray(), includeStatAndSkin: false);
+
+    private static string UniqueItemsTabs(int count)
+    {
+        var tabs = new List<string>();
+        var id = 1;
+        for (var tab = 1; id <= count; tab++)
+        {
+            var rows = new List<string>();
+            for (var row = 0; row < 64 && id <= count; row++, id++)
+            {
+                rows.Add("{\"slot\":\"" + (row == 0 ? "Relic" : "Future" + tab + "_" + row) + "\",\"id\":" + id + ",\"location\":\"Equipped\"}");
+            }
+            tabs.Add(Tab(tab, tab == 1, "[" + string.Join(',', rows) + "]"));
+        }
+        return "[" + string.Join(',', tabs) + "]";
+    }
+
+    private static string DistinctNamespaceTabs(int itemIdentityCount)
+    {
+        var itemIds = Enumerable.Range(1, itemIdentityCount).Select(id => (long)id)
+            .Concat(Enumerable.Repeat(1L, 4096 - itemIdentityCount)).ToArray();
+        return DistinctTabs(itemIds, includeStatAndSkin: true);
+    }
+
+    private static string DistinctTabs(IReadOnlyList<long> itemIds, bool includeStatAndSkin)
+    {
+        var tabs = new List<string>();
+        for (var tab = 1; tab <= 16; tab++)
+        {
+            var rows = new List<string>();
+            for (var row = 0; row < 32; row++)
+            {
+                var offset = ((tab - 1) * 32 + row) * 8;
+                var slot = row == 0 ? "Relic" : "Future" + tab + "_" + row;
+                rows.Add("{\"slot\":\"" + slot + "\",\"id\":" + itemIds[offset] + ",\"location\":\"Equipped\",\"upgrades\":[" + string.Join(',', itemIds.Skip(offset + 1).Take(7)) + "]"
+                    + (includeStatAndSkin && tab == 1 && row == 0 ? ",\"skin\":1,\"stats\":{\"id\":1,\"attributes\":{}}" : "") + "}");
+            }
+            tabs.Add(Tab(tab, tab == 1, "[" + string.Join(',', rows) + "]"));
+        }
+        return "[" + string.Join(',', tabs) + "]";
+    }
+
+    private static string StatRow(int attributes) => "[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"stats\":{\"id\":2,\"attributes\":{" + string.Join(',', Enumerable.Range(1, attributes).Select(id => "\"A" + id + "\":1")) + "}}}]";
+
+    private static string StringBoundaryTabs(string field, int length)
+    {
+        var value = new string('x', length);
+        return field switch
+        {
+            "name" => "[{\"tab\":1,\"name\":\"" + value + "\",\"is_active\":true,\"equipment\":[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\"}]}]",
+            "slot" => Tabs("[{\"slot\":\"" + value + "\",\"id\":1,\"location\":\"Equipped\"},{\"slot\":\"Relic\",\"id\":2,\"location\":\"Equipped\"}]"),
+            "location" => Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"" + value + "\"}]"),
+            "binding" => Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"binding\":\"" + value + "\"}]"),
+            "bound_to" => Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"binding\":\"Character\",\"bound_to\":\"" + value + "\"}]"),
+            _ => Tabs("[{\"slot\":\"Relic\",\"id\":1,\"location\":\"Equipped\",\"stats\":{\"id\":2,\"attributes\":{\"" + value + "\":1}}}]")
+        };
+    }
+
     private static Gw2ApiClient EquipmentClient(HttpClient client) => new(client, new Gw2ApiOptions(new string('k', 16), "https://example.test"));
+    private static string Tabs(string rows) => "[" + Tab(1, true, rows) + "]";
+    private static string Tab(int id, bool active, string rows) => "{\"tab\":" + id + ",\"name\":\"\",\"is_active\":" + (active ? "true" : "false") + ",\"equipment\":" + rows + "}";
     private static string ActiveEquipment(string equipment) => "{\"tab\":1,\"name\":\"\",\"is_active\":true,\"equipment\":" + equipment + "}";
     private static Gw2ApiClient LegendaryArmoryClient(HttpClient httpClient, string? apiKey = null) =>
         new(httpClient, new Gw2ApiOptions(apiKey ?? new string('k', 16), "https://example.test"));
@@ -4486,8 +5292,10 @@ public sealed class Gw2ApiClientTests
     {
         private TimerCallback? callback;
         private object? state;
+        private readonly TaskCompletionSource timeout = new();
 
         public bool Fired { get; private set; }
+        public Task TimeoutTask => timeout.Task;
 
         public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
         {
@@ -4501,6 +5309,7 @@ public sealed class Gw2ApiClientTests
             if (callback is null) throw new InvalidOperationException("The recipe operation did not create an owned timeout.");
             Fired = true;
             callback(state);
+            timeout.TrySetCanceled();
         }
     }
 
@@ -4527,6 +5336,65 @@ public sealed class Gw2ApiClientTests
         }
 
         protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new StallingReadStream(timeProvider));
+    }
+
+    private sealed class TrackedStallingHttpContent(DeferredTimerTimeProvider timeProvider) : HttpContent
+    {
+        public bool IsDisposed { get; private set; }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        {
+            timeProvider.Fire();
+            return timeProvider.TimeoutTask;
+        }
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new StallingReadStream(timeProvider));
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class TrackedJsonContent : HttpContent
+    {
+        private readonly byte[] bytes;
+
+        public TrackedJsonContent(string content) => bytes = Encoding.UTF8.GetBytes(content);
+        public bool IsDisposed { get; private set; }
+
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => stream.WriteAsync(bytes).AsTask();
+        protected override bool TryComputeLength(out long length)
+        {
+            length = bytes.Length;
+            return true;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new MemoryStream(bytes, writable: false));
+
+        protected override void Dispose(bool disposing)
+        {
+            IsDisposed = true;
+            base.Dispose(disposing);
+        }
+    }
+
+    private sealed class CancelOnReadHttpContent(CancellationTokenSource source) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => throw new NotSupportedException();
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() => Task.FromResult<Stream>(new CancelOnReadStream(source));
     }
 
     private sealed class ThrowingTrackedHttpContent : HttpContent
@@ -4622,6 +5490,27 @@ public sealed class Gw2ApiClientTests
         public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
         {
             timeProvider.Fire();
+            await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            return 0;
+        }
+    }
+
+    private sealed class CancelOnReadStream(CancellationTokenSource source) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+        {
+            source.Cancel();
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
             return 0;
         }
@@ -4727,6 +5616,17 @@ public sealed class Gw2ApiClientTests
             }
 
             return Task.FromResult(message);
+        }
+    }
+
+    private sealed class RoutingHandler(Func<HttpRequestMessage, HttpResponseMessage> response) : HttpMessageHandler
+    {
+        public List<string> RequestUris { get; } = [];
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            RequestUris.Add(request.RequestUri!.PathAndQuery);
+            return Task.FromResult(response(request));
         }
     }
 }

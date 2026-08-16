@@ -8,6 +8,17 @@ namespace GW2AccountMCP.Tests;
 
 public sealed class GetCharacterEquipmentTests
 {
+    [Fact]
+    public async Task GetCharacterEquipmentTabsAsync_returns_all_tabs_and_ownership_disclosures()
+    {
+        var client = new FakeGw2ApiClient { EquipmentTabs = new Gw2CharacterEquipmentTabs("Canonical Hero", 1, [new Gw2CharacterEquipmentTab(1, "", true, [])], true, [], DateTimeOffset.UnixEpoch, null, null, null, null, DateTimeOffset.UnixEpoch) };
+
+        var result = await new GetCharacterEquipmentTabsTool(client).GetCharacterEquipmentTabsAsync("Canonical Hero", CancellationToken.None);
+
+        Assert.Equal("AllEquipmentTabsPveWvwCombatReferences", result.EquipmentScope);
+        Assert.False(result.IsOwnershipData);
+        Assert.Equal(1, result.ActiveTab);
+    }
     [Theory]
     [InlineData(null)]
     [InlineData("")]
@@ -77,6 +88,7 @@ public sealed class GetCharacterEquipmentTests
         public bool Called { get; private set; }
         public List<string> Calls { get; } = [];
         public Gw2CharacterEquipment Equipment { get; set; } = null!;
+        public Gw2CharacterEquipmentTabs EquipmentTabs { get; set; } = null!;
         public Exception? Error { get; set; }
         public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken)
         {
@@ -84,6 +96,7 @@ public sealed class GetCharacterEquipmentTests
             Calls.Add("equipment");
             return Error is null ? Task.FromResult(Equipment) : Task.FromException<Gw2CharacterEquipment>(Error);
         }
+        public Task<Gw2CharacterEquipmentTabs> GetCharacterEquipmentTabsAsync(string characterName, CancellationToken cancellationToken) => Task.FromResult(EquipmentTabs);
         public Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) => throw new NotSupportedException();

@@ -14,6 +14,7 @@ public interface IGw2ApiClient
     Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken);
+    Task<Gw2CharacterEquipmentTabs> GetCharacterEquipmentTabsAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken);
     Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken);
     Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken);
@@ -70,6 +71,15 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private const int MaximumEquipmentReferences = 200;
     private const int MaximumEquipmentStatAttributes = 32;
     private const int MaximumFallbackEquipmentRows = 256;
+    private const int MaximumEquipmentTabsPayloadBytes = 2 * 1024 * 1024;
+    private const int MaximumEquipmentTabs = 16;
+    private const int MaximumEquipmentTabRows = 64;
+    private const int MaximumEquipmentTabTotalRows = 512;
+    private const int MaximumEquipmentTabReferences = 4_096;
+    private const int MaximumEquipmentTabStatAttributes = 4_096;
+    private const int MaximumEquipmentTabMetadataIdentities = 4_096;
+    private const int MaximumEquipmentTabWarnings = 256;
+    private const int MaximumEquipmentTabStringLength = 256;
     private static readonly string[] EquipmentSlotOrder = ["Helm", "Shoulders", "Coat", "Gloves", "Leggings", "Boots", "Backpack", "Accessory1", "Accessory2", "Amulet", "Ring1", "Ring2", "WeaponA1", "WeaponA2", "WeaponB1", "WeaponB2", "HelmAquatic", "WeaponAquaticA", "WeaponAquaticB", "Relic"];
     private static readonly HashSet<string> KnownSpecialEquipmentSlots = ["Sickle", "Axe", "Pick", "FishingRod", "FishingBait", "FishingLure", "PowerCore", "SensoryArray", "ServiceChip"];
     private static readonly HashSet<string> KnownInactiveEquipmentLocations = ["Armory", "LegendaryArmory"];
@@ -322,6 +332,62 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         return new Gw2CharacterEquipment(canonicalCharacterName, payload.Tab, payload.Name,
             rows.Select(row => ToEquipmentRow(row, itemMetadata.Rows, itemStats.Rows, skins.Rows)).ToArray(),
             warnings.Count == 0, warnings);
+    }
+
+    public async Task<Gw2CharacterEquipmentTabs> GetCharacterEquipmentTabsAsync(string characterName, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(options.ApiKey)) throw new Gw2ConfigurationException("GW2_API_KEY is not configured. Set it with user-secrets or an environment variable.");
+        if (string.IsNullOrWhiteSpace(characterName)) throw new Gw2ConfigurationException("characterName is required and must not be blank.");
+        try
+        {
+            await ValidateEquipmentTabsPermissionsAsync(["account", "characters", "builds", "inventories"], cancellationToken);
+            using var roster = await SendEquipmentTabsWithSingleRetryAsync("/v2/characters", cancellationToken, true);
+            EnsureAuthenticatedOk(roster.Response, "character-list");
+            var canonicalName = (await DeserializeCharacterNamesAsync(roster.Response, roster.CancellationToken)).SingleOrDefault(name => string.Equals(name, characterName, StringComparison.Ordinal));
+            if (canonicalName is null) throw new Gw2ConfigurationException("The requested character was not found in the authenticated roster.");
+            using var response = await SendEquipmentTabsWithSingleRetryAsync($"/v2/characters/{Uri.EscapeDataString(canonicalName)}/equipmenttabs", cancellationToken, true);
+            EnsureAuthenticatedOk(response.Response, "character-equipment-tabs");
+            var payload = await DeserializeEquipmentTabsAsync(response.Response, response.CancellationToken);
+            var equipmentTabsAsOf = (timeProvider ?? TimeProvider.System).GetUtcNow();
+            if (payload.Count == 0) return new Gw2CharacterEquipmentTabs(canonicalName, null, [], true, [], equipmentTabsAsOf, null, null, null, null, equipmentTabsAsOf);
+            var missingRelics = payload.Where(tab => !tab.Rows.Any(row => row.Slot == "Relic")).ToArray();
+            DateTimeOffset? equipmentAsOf = null;
+            if (missingRelics.Length != 0)
+            {
+                using var fallback = await SendEquipmentTabsWithSingleRetryAsync($"/v2/characters/{Uri.EscapeDataString(canonicalName)}/equipment", cancellationToken, true);
+                EnsureAuthenticatedOk(fallback.Response, "character-equipment");
+                AddFallbackRelics(payload, await DeserializeFallbackEquipmentAsync(fallback.Response, fallback.CancellationToken));
+                equipmentAsOf = (timeProvider ?? TimeProvider.System).GetUtcNow();
+            }
+            var rows = payload.SelectMany(tab => tab.Rows).ToArray();
+            if (rows.Aggregate(0, (count, row) => checked(count + 1 + row.Upgrades.Count + row.Infusions.Count)) > MaximumEquipmentTabReferences
+                || rows.Aggregate(0, (count, row) => checked(count + (row.SelectedAttributes?.Count ?? 0))) > MaximumEquipmentTabStatAttributes)
+                throw InvalidCharacterEquipmentTabsResponse();
+            var itemIds = rows.Select(row => row.ItemId).Concat(rows.SelectMany(row => row.Upgrades)).Concat(rows.SelectMany(row => row.Infusions)).Distinct().Order().ToArray();
+            var selectedStatIds = rows.Where(row => row.SelectedStatId is not null).Select(row => row.SelectedStatId!.Value).Distinct().Order().ToArray();
+            var skinIds = rows.Where(row => row.SkinId is not null).Select(row => row.SkinId!.Value).Distinct().Order().ToArray();
+            EnsureEquipmentTabMetadataIdentityCount(itemIds, selectedStatIds, skinIds);
+            var itemMetadata = await ResolveEquipmentTabItemsAsync(itemIds, rows.Select(row => row.ItemId).ToHashSet(), cancellationToken);
+            var itemsAsOf = itemIds.Length == 0 ? null : (DateTimeOffset?)(timeProvider ?? TimeProvider.System).GetUtcNow();
+            var statIds = selectedStatIds.Concat(rows.Where(row => row.SelectedStatId is null).Select(row => itemMetadata.GetValueOrDefault(row.ItemId)?.DefaultStatId).OfType<long>()).Distinct().Order().ToArray();
+            EnsureEquipmentTabMetadataIdentityCount(itemIds, statIds, skinIds);
+            var stats = await ResolveEquipmentTabNamesAsync("itemstats", statIds, cancellationToken);
+            var statsAsOf = statIds.Length == 0 ? null : (DateTimeOffset?)(timeProvider ?? TimeProvider.System).GetUtcNow();
+            var skins = await ResolveEquipmentTabNamesAsync("skins", skinIds, cancellationToken);
+            var skinsAsOf = skinIds.Length == 0 ? null : (DateTimeOffset?)(timeProvider ?? TimeProvider.System).GetUtcNow();
+            var warnings = new List<Gw2MetadataWarning>(); AddEquipmentWarnings(warnings, "items", itemIds, itemMetadata.Keys); AddEquipmentWarnings(warnings, "itemstats", statIds, stats.Keys); AddEquipmentWarnings(warnings, "skins", skinIds, skins.Keys);
+            if (warnings.Count > MaximumEquipmentTabWarnings)
+            {
+                var overflow = warnings.Count - (MaximumEquipmentTabWarnings - 1);
+                var resolver = warnings.Select(warning => warning.Resolver).Distinct(StringComparer.Ordinal).Take(2).Count() == 1 ? warnings[0].Resolver : "multiple";
+                warnings = warnings.Take(MaximumEquipmentTabWarnings - 1).Append(new Gw2MetadataWarning("metadata_warning_limit_reached", resolver, overflow.ToString(CultureInfo.InvariantCulture))).ToList();
+            }
+            return new Gw2CharacterEquipmentTabs(canonicalName, payload.Single(tab => tab.IsActive).Tab, payload.OrderBy(tab => tab.Tab).Select(tab => new Gw2CharacterEquipmentTab(tab.Tab, tab.Name, tab.IsActive, tab.Rows.OrderBy(row => Array.IndexOf(EquipmentSlotOrder, row.Slot) is var index && index >= 0 ? index : int.MaxValue).ThenBy(row => row.Slot, StringComparer.Ordinal).Select(row => ToEquipmentRow(row, itemMetadata, stats, skins)).ToArray())).ToArray(), warnings.Count == 0, warnings, equipmentTabsAsOf, equipmentAsOf, itemsAsOf, statsAsOf, skinsAsOf, (timeProvider ?? TimeProvider.System).GetUtcNow());
+        }
+        catch (IOException) { throw InvalidCharacterEquipmentTabsResponse(); }
+        catch (JsonException) { throw InvalidCharacterEquipmentTabsResponse(); }
+        catch (HttpRequestException) { throw InvalidCharacterEquipmentTabsResponse(); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { throw new Gw2ConfigurationException("GW2 character equipment-tabs request timed out. Try again later."); }
     }
 
     public async Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken)
@@ -1353,6 +1419,21 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             {
                 throw new Gw2ConfigurationException($"GW2_API_KEY is missing the required {requiredPermission} permission. Create a key with the {requiredPermission} permission.");
             }
+        }
+    }
+
+    private async Task ValidateEquipmentTabsPermissionsAsync(IReadOnlyList<string> requiredPermissions, CancellationToken cancellationToken)
+    {
+        using var request = await SendEquipmentTabsWithSingleRetryAsync("/v2/tokeninfo", cancellationToken, authenticated: true);
+        if (request.Response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) throw InvalidKey();
+        if (request.Response.StatusCode != HttpStatusCode.OK)
+            throw new Gw2ConfigurationException($"GW2 key validation failed with HTTP {(int)request.Response.StatusCode}. Try again later.");
+
+        var tokenInfo = await DeserializeTokenInfoAsync(request.Response, request.CancellationToken);
+        foreach (var permission in requiredPermissions)
+        {
+            if (!tokenInfo.Permissions!.Contains(permission, StringComparer.OrdinalIgnoreCase))
+                throw new Gw2ConfigurationException($"GW2_API_KEY is missing the required {permission} permission. Create a key with the {permission} permission.");
         }
     }
 
@@ -2616,6 +2697,157 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         catch (JsonException) { throw InvalidCharacterEquipmentResponse(); }
     }
 
+    private async Task<List<EquipmentTabsPayload>> DeserializeEquipmentTabsAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+        if (bytes.Length > MaximumEquipmentTabsPayloadBytes) throw InvalidCharacterEquipmentTabsResponse();
+        try
+        {
+            using var document = JsonDocument.Parse(bytes);
+            if (document.RootElement.ValueKind != JsonValueKind.Array || document.RootElement.GetArrayLength() > MaximumEquipmentTabs) throw InvalidCharacterEquipmentTabsResponse();
+            var tabs = new List<EquipmentTabsPayload>();
+            var total = 0;
+            var references = 0;
+            var statAttributes = 0;
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                var tab = EquipmentObject(element); var id = EquipmentInt(tab, "tab"); var name = EquipmentString(tab, "name", true);
+                if (id <= 0 || name.Length > MaximumEquipmentTabStringLength || tabs.Any(existing => existing.Tab == id)) throw InvalidCharacterEquipmentTabsResponse();
+                var equipment = EquipmentArray(tab, "equipment"); if (equipment.GetArrayLength() > MaximumEquipmentTabRows || checked(total += equipment.GetArrayLength()) > MaximumEquipmentTabTotalRows) throw InvalidCharacterEquipmentTabsResponse();
+                var rows = new List<AuthenticatedEquipmentRow>();
+                foreach (var elementRow in equipment.EnumerateArray())
+                {
+                    var row = EquipmentObject(elementRow); var slot = EquipmentString(row, "slot", false);
+                    if (slot.Length > MaximumEquipmentTabStringLength) throw InvalidCharacterEquipmentTabsResponse();
+                    if (KnownSpecialEquipmentSlots.Contains(slot)) continue;
+                    var parsed = ParseEquipmentRow(row, slot, primary: false);
+                    if (parsed.Location.Length > MaximumEquipmentTabStringLength || parsed.Binding?.Length > MaximumEquipmentTabStringLength || parsed.BoundTo?.Length > MaximumEquipmentTabStringLength || rows.Any(existing => existing.Slot == slot)) throw InvalidCharacterEquipmentTabsResponse();
+                    if (parsed.Upgrades.Count > 16 || parsed.Infusions.Count > 16 || parsed.SelectedAttributes?.Count > 32) throw InvalidCharacterEquipmentTabsResponse();
+                    if (parsed.SelectedAttributes?.Any(attribute => attribute.Name.Length > MaximumEquipmentTabStringLength) == true) throw InvalidCharacterEquipmentTabsResponse();
+                    if (checked(references += 1 + parsed.Upgrades.Count + parsed.Infusions.Count) > MaximumEquipmentTabReferences
+                        || checked(statAttributes += parsed.SelectedAttributes?.Count ?? 0) > MaximumEquipmentTabStatAttributes) throw InvalidCharacterEquipmentTabsResponse();
+                    rows.Add(parsed);
+                }
+                tabs.Add(new EquipmentTabsPayload(id, name, EquipmentBoolean(tab, "is_active"), rows));
+            }
+            if (tabs.Count != 0 && tabs.Count(tab => tab.IsActive) != 1) throw InvalidCharacterEquipmentTabsResponse();
+            return tabs;
+        }
+        catch (Exception exception) when (exception is JsonException or Gw2ConfigurationException or OverflowException) { throw InvalidCharacterEquipmentTabsResponse(); }
+    }
+
+    private async Task<List<FallbackEquipmentRow>> DeserializeFallbackEquipmentAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken); if (bytes.Length > MaximumEquipmentTabsPayloadBytes) throw InvalidCharacterEquipmentTabsResponse();
+        try
+        {
+            using var document = JsonDocument.Parse(bytes); var equipment = EquipmentArray(EquipmentObject(document.RootElement), "equipment");
+            if (equipment.GetArrayLength() > MaximumEquipmentTabTotalRows) throw InvalidCharacterEquipmentTabsResponse();
+            var rows = new List<FallbackEquipmentRow>();
+            var references = 0;
+            var statAttributes = 0;
+            foreach (var element in equipment.EnumerateArray())
+            {
+                if (element.ValueKind != JsonValueKind.Object || !TryEquipmentString(element, "slot", out var slot) || slot != "Relic") continue;
+                var tabs = EquipmentArray(element, "tabs").EnumerateArray().Select(value => value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var id) && id > 0 ? id : throw InvalidCharacterEquipmentTabsResponse()).ToArray();
+                if (tabs.Length == 0 || tabs.Distinct().Count() != tabs.Length) throw InvalidCharacterEquipmentTabsResponse();
+                var parsed = ParseEquipmentRow(element, slot, false);
+                if (parsed.Location.Length > MaximumEquipmentTabStringLength || parsed.Binding?.Length > MaximumEquipmentTabStringLength || parsed.BoundTo?.Length > MaximumEquipmentTabStringLength || parsed.Upgrades.Count > 16 || parsed.Infusions.Count > 16 || parsed.SelectedAttributes?.Count > 32 || parsed.SelectedAttributes?.Any(attribute => attribute.Name.Length > MaximumEquipmentTabStringLength) == true) throw InvalidCharacterEquipmentTabsResponse();
+                if (checked(references += 1 + parsed.Upgrades.Count + parsed.Infusions.Count) > MaximumEquipmentTabReferences || checked(statAttributes += parsed.SelectedAttributes?.Count ?? 0) > MaximumEquipmentTabStatAttributes) throw InvalidCharacterEquipmentTabsResponse();
+                rows.Add(new FallbackEquipmentRow(parsed, tabs));
+            }
+            return rows;
+        }
+        catch (Exception exception) when (exception is JsonException or Gw2ConfigurationException or OverflowException) { throw InvalidCharacterEquipmentTabsResponse(); }
+    }
+
+    private static void AddFallbackRelics(IReadOnlyList<EquipmentTabsPayload> tabs, IReadOnlyList<FallbackEquipmentRow> fallback)
+    {
+        var returnedTabIds = tabs.Select(tab => tab.Tab).ToHashSet();
+        if (fallback.SelectMany(row => row.Tabs).Any(tabId => !returnedTabIds.Contains(tabId))) throw InvalidCharacterEquipmentTabsResponse();
+        foreach (var tab in tabs.Where(tab => !tab.Rows.Any(row => row.Slot == "Relic")))
+        {
+            var matches = fallback.Where(row => row.Tabs.Contains(tab.Tab)).ToArray();
+            if (matches.Length != 1) throw InvalidCharacterEquipmentTabsResponse();
+            tab.Rows.Add(matches[0].Row);
+        }
+    }
+
+    private async Task<Dictionary<long, EquipmentItemMetadata>> ResolveEquipmentTabItemsAsync(IReadOnlyList<long> ids, IReadOnlySet<long> primaryIds, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<long, EquipmentItemMetadata>();
+        foreach (var chunk in ids.Chunk(MaximumItemBatchSize))
+        {
+            var batch = await ResolveEquipmentTabItemsBatchAsync(chunk, primaryIds, cancellationToken);
+            foreach (var row in batch) result[row.Key] = row.Value;
+        }
+        return result;
+    }
+    private async Task<Dictionary<long, string>> ResolveEquipmentTabNamesAsync(string resolver, IReadOnlyList<long> ids, CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<long, string>();
+        foreach (var chunk in ids.Chunk(MaximumItemBatchSize))
+        {
+            var batch = await ResolveEquipmentTabNamesBatchAsync(resolver, chunk, cancellationToken);
+            foreach (var row in batch) result[row.Key] = row.Value;
+        }
+        return result;
+    }
+
+    private static void EnsureEquipmentTabMetadataIdentityCount(IReadOnlyCollection<long> itemIds, IReadOnlyCollection<long> statIds, IReadOnlyCollection<long> skinIds)
+    {
+        if (checked(itemIds.Count + statIds.Count + skinIds.Count) > MaximumEquipmentTabMetadataIdentities) throw InvalidCharacterEquipmentTabsResponse();
+    }
+
+    private async Task<Dictionary<long, EquipmentItemMetadata>> ResolveEquipmentTabItemsBatchAsync(IReadOnlyList<long> requestedIds, IReadOnlySet<long> primaryIds, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = await SendEquipmentTabsWithSingleRetryAsync($"/v2/items?ids={Uri.EscapeDataString(string.Join(',', requestedIds))}", cancellationToken, authenticated: false);
+            if (request.Response.StatusCode == HttpStatusCode.NotFound) return [];
+            if (request.Response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) return [];
+            using var document = await JsonDocument.ParseAsync(await request.Response.Content.ReadAsStreamAsync(request.CancellationToken), cancellationToken: request.CancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return [];
+            var rows = new Dictionary<long, EquipmentItemMetadata>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                var item = EquipmentObject(element);
+                var id = EquipmentLong(item, "id");
+                var name = EquipmentString(item, "name", true);
+                if (id <= 0 || !requestedIds.Contains(id) || !rows.TryAdd(id, ParseEquipmentItemMetadata(item, id, name, primaryIds.Contains(id)))) return [];
+            }
+            return IsValidEquipmentTabBatch(request.Response.StatusCode, requestedIds.Count, rows.Count) ? rows : [];
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return []; }
+    }
+
+    private async Task<Dictionary<long, string>> ResolveEquipmentTabNamesBatchAsync(string resolver, IReadOnlyList<long> requestedIds, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var request = await SendEquipmentTabsWithSingleRetryAsync($"/v2/{resolver}?ids={Uri.EscapeDataString(string.Join(',', requestedIds))}", cancellationToken, authenticated: false);
+            if (request.Response.StatusCode == HttpStatusCode.NotFound) return [];
+            if (request.Response.StatusCode is not HttpStatusCode.OK and not HttpStatusCode.PartialContent) return [];
+            using var document = await JsonDocument.ParseAsync(await request.Response.Content.ReadAsStreamAsync(request.CancellationToken), cancellationToken: request.CancellationToken);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return [];
+            var rows = new Dictionary<long, string>();
+            foreach (var element in document.RootElement.EnumerateArray())
+            {
+                var row = EquipmentObject(element);
+                var id = EquipmentLong(row, "id");
+                var name = EquipmentString(row, "name", false);
+                if (id <= 0 || !requestedIds.Contains(id) || !rows.TryAdd(id, name)) return [];
+            }
+            return IsValidEquipmentTabBatch(request.Response.StatusCode, requestedIds.Count, rows.Count) ? rows : [];
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch { return []; }
+    }
+
+    private static bool IsValidEquipmentTabBatch(HttpStatusCode statusCode, int requestedCount, int returnedCount) =>
+        statusCode == HttpStatusCode.OK ? returnedCount == requestedCount : returnedCount > 0 && returnedCount < requestedCount;
+
     private async Task<AuthenticatedEquipmentRow?> DeserializeFallbackRelicAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
         try
@@ -2669,7 +2901,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
             if (pairs.Count > MaximumEquipmentStatAttributes) throw InvalidCharacterEquipmentResponse();
             selectedAttributes = pairs.Count == 0 ? null : pairs.OrderBy(pair => pair.Name, StringComparer.Ordinal).ToArray();
         }
-        var referenceKind = location == "Equipped" ? "EquippedReference" : location == "EquippedFromLegendaryArmory" ? "LegendaryArmoryReference" : "UnknownEquipmentReference";
+        var referenceKind = location == "Equipped" ? "EquippedReference" : location == "Armory" ? "EquipmentTemplateReference" : location is "EquippedFromLegendaryArmory" or "LegendaryArmory" ? "LegendaryArmoryReference" : "UnknownEquipmentReference";
         return new AuthenticatedEquipmentRow(slot, itemId, skinId, upgrades, infusions, binding, boundTo, location, referenceKind, selectedStatId, selectedAttributes);
     }
 
@@ -3048,6 +3280,9 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
         }
     }
 
+    private Task<TimedHttpResponse> SendEquipmentTabsWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated) =>
+        SendAchievementWithSingleRetryAsync(path, cancellationToken, authenticated);
+
     private async Task<TimedHttpResponse> SendRecipeWithSingleRetryAsync(string path, CancellationToken cancellationToken, bool authenticated)
     {
         for (var attempt = 0; ; attempt++)
@@ -3289,6 +3524,7 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     private static Gw2ConfigurationException InvalidTokenPermissionResponse() => new("GW2 returned an invalid token-permission response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterBuildResponse() => new("GW2 returned an invalid character-build response. Try again later.");
     private static Gw2ConfigurationException InvalidCharacterEquipmentResponse() => new("GW2 returned an invalid character-equipment response. Try again later.");
+    private static Gw2ConfigurationException InvalidCharacterEquipmentTabsResponse() => new("GW2 returned an invalid character-equipment-tabs response. Try again later.");
     private static Gw2ConfigurationException CharacterInventoryContextLimitExceeded() => new("GW2 character inventory exceeds configured response limits. Try again later.");
 
     private sealed class TimedHttpResponse(
@@ -3308,6 +3544,8 @@ public sealed class Gw2ApiClient(HttpClient httpClient, Gw2ApiOptions options, T
     }
 
     private sealed record ActiveBuildPayload(int Tab, string Name, string Profession, IReadOnlyList<SpecializationSlot> Specializations, SkillSlots TerrestrialSkills, SkillSlots AquaticSkills, PetSlots? Pets, LegendSlots? Legends);
+    private sealed record EquipmentTabsPayload(int Tab, string Name, bool IsActive, List<AuthenticatedEquipmentRow> Rows);
+    private sealed record FallbackEquipmentRow(AuthenticatedEquipmentRow Row, IReadOnlyList<int> Tabs);
     private sealed record SpecializationSlot(int? Id, IReadOnlyList<int?> Traits);
     private sealed record SkillSlots(int? Heal, IReadOnlyList<int?> Utilities, int? Elite)
     {
@@ -3523,6 +3761,8 @@ public sealed record Gw2NumericReference(int Id, string? Name);
 public sealed record Gw2LegendReference(string Id, int? Code, Gw2NumericReference? SwapSkill);
 public sealed record Gw2MetadataWarning(string Code, string Resolver, string ReferenceId);
 public sealed record Gw2CharacterEquipment(string CharacterName, int Tab, string EquipmentTabName, IReadOnlyList<Gw2EquipmentRow> Equipment, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings);
+public sealed record Gw2CharacterEquipmentTabs(string CharacterName, int? ActiveTab, IReadOnlyList<Gw2CharacterEquipmentTab> Tabs, bool IsMetadataComplete, IReadOnlyList<Gw2MetadataWarning> Warnings, DateTimeOffset EquipmentTabsAsOf, DateTimeOffset? EquipmentAsOf, DateTimeOffset? ItemsAsOf, DateTimeOffset? ItemStatsAsOf, DateTimeOffset? SkinsAsOf, DateTimeOffset AsOf);
+public sealed record Gw2CharacterEquipmentTab(int Tab, string EquipmentTabName, bool IsActive, IReadOnlyList<Gw2EquipmentRow> Equipment);
 public sealed record Gw2EquipmentRow(string Slot, Gw2EquipmentItem Item, Gw2EquipmentStat? Stats, IReadOnlyList<Gw2EquipmentReference> Upgrades, IReadOnlyList<Gw2EquipmentReference> Infusions, Gw2EquipmentReference? Skin, string? Binding, string? BoundTo, string Location, string ReferenceKind);
 public sealed record Gw2EquipmentItem(long Id, string? Name, string? Type, string? Subtype, string? Rarity, int? Level);
 public sealed record Gw2EquipmentStat(long Id, string? Name, string Source, IReadOnlyList<Gw2EquipmentStatAttribute>? Attributes);

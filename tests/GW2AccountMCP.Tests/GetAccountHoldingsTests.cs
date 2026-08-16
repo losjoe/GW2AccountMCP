@@ -445,6 +445,7 @@ public sealed class GetAccountHoldingsTests
         public Task<Gw2Characters> GetCharactersAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2CharacterBuild> GetCharacterBuildAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2CharacterEquipment> GetCharacterEquipmentAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2CharacterEquipmentTabs> GetCharacterEquipmentTabsAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2CharacterInventory> GetCharacterInventoryAsync(string characterName, CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2AccountStorage> GetAccountStorageAsync(CancellationToken cancellationToken) => Complete("storage", AccountStorage, StorageError);
         public Task<Gw2CharacterBags> GetCharacterBagsAsync(CancellationToken cancellationToken) => Complete("bags", CharacterBags, CharacterError);

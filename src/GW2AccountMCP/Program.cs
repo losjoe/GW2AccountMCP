@@ -49,6 +49,7 @@ builder.Services
     .WithTools<GetLegendaryArmoryTool>()
     .WithTools<GetCharacterBuildTool>()
     .WithTools<GetCharacterEquipmentTool>()
+    .WithTools<GetCharacterEquipmentTabsTool>()
     .WithTools<GetCharacterInventoryTool>()
     .WithTools<GetCharactersTool>()
     .WithTools<GetWalletTool>();
