@@ -23,9 +23,11 @@ public sealed class GetTradingPostActivityToolTests
         var result = await tool.GetTradingPostActivityAsync("CurrentBuys", null, null, CancellationToken.None);
 
         Assert.Equal(("CurrentBuys", 0, 50, 2, 51L, 2, true), (result.Mode, result.Page, result.PageSize, result.PageCount, result.TotalCount, result.ReturnedCount, result.HasMore));
-        Assert.Equal([20L, 10L], result.CurrentBuys.Orders.Select(order => order.ItemId));
-        Assert.Equal([21L, 20L], result.CurrentBuys.Orders.Select(order => order.ReservedCoinCopper));
-        Assert.Equal(41, result.CurrentBuys.ReservedCoinPageSubtotalCopper);
+        var currentBuys = Assert.IsType<CurrentBuysActivityResult>(result.CurrentBuys);
+        Assert.Null(result.CurrentSells);
+        Assert.Equal([20L, 10L], currentBuys.Orders.Select(order => order.ItemId));
+        Assert.Equal([21L, 20L], currentBuys.Orders.Select(order => order.ReservedCoinCopper));
+        Assert.Equal(41, currentBuys.ReservedCoinPageSubtotalCopper);
         Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:00Z"), result.AsOf);
         Assert.False(result.IsAtomicSnapshot);
         Assert.Contains("not owned", result.SourceStatement, StringComparison.OrdinalIgnoreCase);
@@ -34,9 +36,36 @@ public sealed class GetTradingPostActivityToolTests
         Assert.Equal([(0, 50)], client.Calls);
     }
 
+    [Fact]
+    public async Task GetTradingPostActivityTool_returns_current_sells_in_source_order_with_current_buys_explicitly_null()
+    {
+        var client = new FakeGw2ApiClient
+        {
+            SellsPage = new Gw2CurrentSellsPage(1, 2, 3, 5,
+            [
+                new Gw2CurrentSellPageOrder(20, 7, 251, DateTimeOffset.Parse("2026-01-02T03:04:05Z")),
+                new Gw2CurrentSellPageOrder(10, 5, 4, DateTimeOffset.Parse("2026-01-03T03:04:05Z"))
+            ])
+        };
+
+        var result = await new GetTradingPostActivityTool(client, new FixedTimeProvider()).GetTradingPostActivityAsync("CurrentSells", 1, 2, CancellationToken.None);
+
+        Assert.Equal(("CurrentSells", 1, 2, 3, 5L, 2, true), (result.Mode, result.Page, result.PageSize, result.PageCount, result.TotalCount, result.ReturnedCount, result.HasMore));
+        Assert.Null(result.CurrentBuys);
+        var currentSells = Assert.IsType<CurrentSellsActivityResult>(result.CurrentSells);
+        Assert.Equal([(20L, 7L, 251L), (10L, 5L, 4L)], currentSells.Orders.Select(order => (order.ItemId, order.UnitPriceCopper, order.Quantity)));
+        Assert.Equal(DateTimeOffset.Parse("2026-08-16T12:00:00Z"), result.AsOf);
+        Assert.False(result.IsAtomicSnapshot);
+        Assert.Contains("unfulfilled", result.SourceStatement, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("listedForSale", result.SourceStatement, StringComparison.Ordinal);
+        Assert.Contains("five minutes", result.FreshnessStatement, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("selected page", result.CompletenessStatement, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal([(1, 2)], client.SellCalls);
+        Assert.Empty(client.Calls);
+    }
+
     [Theory]
     [InlineData(null, null, null)]
-    [InlineData("CurrentSells", null, null)]
     [InlineData("currentbuys", null, null)]
     [InlineData("CurrentBuys", -1, null)]
     [InlineData("CurrentBuys", null, 0)]
@@ -100,12 +129,19 @@ public sealed class GetTradingPostActivityToolTests
     private sealed class FakeGw2ApiClient : IGw2ApiClient
     {
         public List<(int Page, int PageSize)> Calls { get; } = [];
+        public List<(int Page, int PageSize)> SellCalls { get; } = [];
         public Gw2CurrentBuysPage Page { get; set; } = new(0, 50, 0, 0, []);
+        public Gw2CurrentSellsPage SellsPage { get; set; } = new(0, 50, 0, 0, []);
         public Exception? Error { get; set; }
         public Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken)
         {
             Calls.Add((page, pageSize));
             return Error is null ? Task.FromResult(Page) : Task.FromException<Gw2CurrentBuysPage>(Error);
+        }
+        public Task<Gw2CurrentSellsPage> GetCurrentSellsPageAsync(int page, int pageSize, CancellationToken cancellationToken)
+        {
+            SellCalls.Add((page, pageSize));
+            return Error is null ? Task.FromResult(SellsPage) : Task.FromException<Gw2CurrentSellsPage>(Error);
         }
         public Task<Gw2Account> GetAccountAsync(CancellationToken cancellationToken) => throw new NotSupportedException();
         public Task<Gw2Wallet> GetWalletAsync(CancellationToken cancellationToken) => throw new NotSupportedException();

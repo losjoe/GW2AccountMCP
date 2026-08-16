@@ -43,11 +43,12 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.Equal(["mode", "page", "pageSize"], activity.GetProperty("inputSchema").GetProperty("properties").EnumerateObject().Select(property => property.Name));
         AssertSchemaRequired(activity.GetProperty("inputSchema"), "mode");
         var activityOutput = activity.GetProperty("outputSchema");
-        Assert.Equal(["mode", "currentBuys", "page", "pageSize", "pageCount", "totalCount", "returnedCount", "hasMore", "asOf", "isAtomicSnapshot", "sourceStatement", "freshnessStatement", "completenessStatement"], activityOutput.GetProperty("properties").EnumerateObject().Select(property => property.Name));
-        AssertSchemaRequired(activityOutput, "mode", "currentBuys", "page", "pageSize", "pageCount", "totalCount", "returnedCount", "hasMore", "asOf", "isAtomicSnapshot", "sourceStatement", "freshnessStatement", "completenessStatement");
+        Assert.Equal(["mode", "currentBuys", "currentSells", "page", "pageSize", "pageCount", "totalCount", "returnedCount", "hasMore", "asOf", "isAtomicSnapshot", "sourceStatement", "freshnessStatement", "completenessStatement"], activityOutput.GetProperty("properties").EnumerateObject().Select(property => property.Name));
+        AssertSchemaRequired(activityOutput, "mode", "currentBuys", "currentSells", "page", "pageSize", "pageCount", "totalCount", "returnedCount", "hasMore", "asOf", "isAtomicSnapshot", "sourceStatement", "freshnessStatement", "completenessStatement");
         AssertSchemaRequired(activityOutput.GetProperty("properties").GetProperty("currentBuys"), "orders", "reservedCoinPageSubtotalCopper");
         AssertSchemaRequired(activityOutput.GetProperty("properties").GetProperty("currentBuys").GetProperty("properties").GetProperty("orders").GetProperty("items"), "itemId", "unitPriceCopper", "quantity", "createdAt", "reservedCoinCopper");
-        Assert.DoesNotContain("CurrentSells", activity.GetRawText(), StringComparison.Ordinal);
+        AssertSchemaRequired(activityOutput.GetProperty("properties").GetProperty("currentSells"), "orders");
+        AssertSchemaRequired(activityOutput.GetProperty("properties").GetProperty("currentSells").GetProperty("properties").GetProperty("orders").GetProperty("items"), "itemId", "unitPriceCopper", "quantity", "createdAt");
         var prices = toolsByName["get_item_prices"];
         AssertSchemaRequired(prices.GetProperty("inputSchema"), "itemIds");
         AssertSchemaRequired(prices.GetProperty("outputSchema"), "items", "sourceStartedAtUtc", "sourceCompletedAtUtc", "cacheGeneratedAtUtc", "asOf", "collectionDuration", "cacheAge", "freshnessStatus", "freshnessStatement", "isCompletePriceGeneration", "warnings");
@@ -204,8 +205,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         using var document = JsonDocument.Parse(payload);
 
         var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
-        Assert.Equal(["mode", "currentBuys", "page", "pageSize", "pageCount", "totalCount", "returnedCount", "hasMore", "asOf", "isAtomicSnapshot", "sourceStatement", "freshnessStatement", "completenessStatement"], structured.EnumerateObject().Select(property => property.Name));
+        Assert.Equal(["mode", "currentBuys", "currentSells", "page", "pageSize", "pageCount", "totalCount", "returnedCount", "hasMore", "asOf", "isAtomicSnapshot", "sourceStatement", "freshnessStatement", "completenessStatement"], structured.EnumerateObject().Select(property => property.Name));
         Assert.Equal("CurrentBuys", structured.GetProperty("mode").GetString());
+        Assert.Equal(JsonValueKind.Null, structured.GetProperty("currentSells").ValueKind);
         Assert.Equal((0, 50, 1, 1L, 1, false), (structured.GetProperty("page").GetInt32(), structured.GetProperty("pageSize").GetInt32(), structured.GetProperty("pageCount").GetInt32(), structured.GetProperty("totalCount").GetInt64(), structured.GetProperty("returnedCount").GetInt32(), structured.GetProperty("hasMore").GetBoolean()));
         var order = Assert.Single(structured.GetProperty("currentBuys").GetProperty("orders").EnumerateArray());
         Assert.Equal(["itemId", "unitPriceCopper", "quantity", "createdAt", "reservedCoinCopper"], order.EnumerateObject().Select(property => property.Name));
@@ -216,6 +218,28 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         Assert.Contains("five minutes", structured.GetProperty("freshnessStatement").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.Contains("selected page only", structured.GetProperty("completenessStatement").GetString(), StringComparison.OrdinalIgnoreCase);
         Assert.False(order.TryGetProperty("id", out _));
+        Assert.DoesNotContain("private", payload, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetTradingPostActivity_returns_minimal_structured_current_sell_page()
+    {
+        await InitializeAsync();
+        using var response = await PostMcpAsync(29, "tools/call", new { name = "get_trading_post_activity", arguments = new { mode = "CurrentSells" } });
+        response.EnsureSuccessStatusCode();
+        var payload = await ReadMcpResponseAsync(response);
+        using var document = JsonDocument.Parse(payload);
+
+        var structured = document.RootElement.GetProperty("result").GetProperty("structuredContent");
+        Assert.Equal("CurrentSells", structured.GetProperty("mode").GetString());
+        Assert.Equal(JsonValueKind.Null, structured.GetProperty("currentBuys").ValueKind);
+        var order = Assert.Single(structured.GetProperty("currentSells").GetProperty("orders").EnumerateArray());
+        Assert.Equal(["itemId", "unitPriceCopper", "quantity", "createdAt"], order.EnumerateObject().Select(property => property.Name));
+        Assert.False(order.TryGetProperty("id", out _));
+        Assert.Contains("listedForSale", structured.GetProperty("sourceStatement").GetString(), StringComparison.Ordinal);
+        Assert.Contains("five minutes", structured.GetProperty("freshnessStatement").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("selected page", structured.GetProperty("completenessStatement").GetString(), StringComparison.OrdinalIgnoreCase);
+        Assert.False(structured.GetProperty("isAtomicSnapshot").GetBoolean());
         Assert.DoesNotContain("private", payload, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -964,6 +988,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2CurrentBuysPage(page, pageSize, 1, 1, [new Gw2CurrentBuyOrder(101, 100, 2, DateTimeOffset.Parse("2026-01-01T00:00:00Z"))]));
 
+        public Task<Gw2CurrentSellsPage> GetCurrentSellsPageAsync(int page, int pageSize, CancellationToken cancellationToken) =>
+            Task.FromResult(new Gw2CurrentSellsPage(page, pageSize, 1, 1, [new Gw2CurrentSellPageOrder(101, 100, 2, DateTimeOffset.Parse("2026-01-01T00:00:00Z"))]));
+
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             Task.FromResult(new Gw2Items([new Gw2Item(101, "Synthetic Item")], []));
 
@@ -1031,6 +1058,9 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
         public Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("private current-buys failure");
 
+        public Task<Gw2CurrentSellsPage> GetCurrentSellsPageAsync(int page, int pageSize, CancellationToken cancellationToken) =>
+            throw new Gw2ConfigurationException("private current-sells failure");
+
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("GW2 item metadata request failed with HTTP 503. Try again later.");
 
@@ -1082,6 +1112,7 @@ public sealed class McpEndpointTests : IClassFixture<McpEndpointTests.McpApplica
             throw new Gw2ConfigurationException("Synthetic current-sells failure.");
 
         public Task<Gw2CurrentBuysPage> GetCurrentBuysPageAsync(int page, int pageSize, CancellationToken cancellationToken) => throw new NotSupportedException();
+        public Task<Gw2CurrentSellsPage> GetCurrentSellsPageAsync(int page, int pageSize, CancellationToken cancellationToken) => throw new NotSupportedException();
 
         public Task<Gw2Items> GetItemsAsync(IReadOnlyList<long> itemIds, CancellationToken cancellationToken) =>
             throw new Gw2ConfigurationException("Synthetic metadata failure.");
